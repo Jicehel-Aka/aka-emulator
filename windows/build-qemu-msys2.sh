@@ -5,14 +5,14 @@
 set -e
 pacman -S --needed --noconfirm \
   mingw-w64-x86_64-toolchain mingw-w64-x86_64-glib2 mingw-w64-x86_64-pixman \
-  mingw-w64-x86_64-libslirp mingw-w64-x86_64-SDL2 \
+  mingw-w64-x86_64-SDL2 mingw-w64-x86_64-dtc \
   base-devel git ninja python mingw-w64-x86_64-python-setuptools mingw-w64-x86_64-meson
 
 cd "$(dirname "$0")/../qemu"
 mkdir -p build-win && cd build-win
 ../configure --target-list=xtensa-softmmu --disable-docs --disable-tools --disable-user \
   --disable-gtk --disable-vnc --disable-sdl --disable-werror --disable-guest-agent \
-  --enable-slirp --disable-debug-info --extra-cflags="-O3"
+  --disable-slirp --enable-fdt=system --disable-debug-info --extra-cflags="-O3"
 ninja qemu-system-xtensa.exe
 
 # Dossier distribuable : qemu + DLL + bios + front-end

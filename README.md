@@ -5,7 +5,7 @@ Fait tourner le **vrai firmware ESP32-S3** (.bin) dans QEMU, avec un front-end S
 depuis `partitions.bin` (Launcher dans app1, jeux installés dans app0, comme sur la console).
 
 ## Démarrage rapide (Linux)
-    sudo apt install libsdl2-2.0-0 libglib2.0-0 libpixman-1-0 libfdt1 libslirp0
+    sudo apt install libsdl2-2.0-0 libglib2.0-0 libpixman-1-0 libfdt1
     ./run.sh                      # utilise aka-emu.cfg (Launcher + SD d'exemple avec pAKAman)
 
 Dans le Launcher : **A** installe/lance le jeu choisi, **D** relit la SD.
@@ -32,7 +32,7 @@ SD (SPI), flash SPI + cache avec OTA (esp_ota_*), SHA, audio I2S → SDL (44,1 k
 
 ## Recompiler QEMU
 Prendre le fork Espressif QEMU (commit dans `qemu-patch/README.md`), `git apply qemu-patch/aka-qemu.patch`, puis :
-`../configure --target-list=xtensa-softmmu --disable-docs --disable-tools --disable-user --disable-gtk --disable-vnc --disable-sdl --enable-fdt=system --enable-slirp --disable-debug-info && ninja qemu-system-xtensa`
+`../configure --target-list=xtensa-softmmu --disable-docs --disable-tools --disable-user --disable-gtk --disable-vnc --disable-sdl --enable-fdt=system --disable-debug-info && ninja qemu-system-xtensa`
 (Le patch référence déjà `aka_i2s.c` dans `hw/misc/meson.build`.)
 
 ## Limites connues

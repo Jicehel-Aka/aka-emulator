@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 env:
-  QEMU_FLAGS: --target-list=xtensa-softmmu --disable-docs --disable-tools --disable-user --disable-gtk --disable-vnc --disable-sdl --disable-werror --enable-slirp --disable-debug-info
+  QEMU_FLAGS: --target-list=xtensa-softmmu --disable-docs --disable-tools --disable-user --disable-gtk --disable-vnc --disable-sdl --disable-werror --disable-slirp --disable-debug-info
 
 jobs:
   linux:
@@ -15,7 +15,7 @@ jobs:
       - name: Dependances
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev libsdl2-dev
+          sudo apt-get install -y g++ ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev libfdt-dev libsdl2-dev
       - name: Fork QEMU Espressif + patch AKA
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/espressif/qemu.git qemu
@@ -63,7 +63,7 @@ jobs:
           install: >-
             git base-devel ninja python
             mingw-w64-x86_64-toolchain mingw-w64-x86_64-glib2 mingw-w64-x86_64-pixman
-            mingw-w64-x86_64-libslirp mingw-w64-x86_64-SDL2 mingw-w64-x86_64-python-setuptools
+            mingw-w64-x86_64-SDL2 mingw-w64-x86_64-python-setuptools
             mingw-w64-x86_64-meson mingw-w64-x86_64-dtc
       - name: Fork QEMU Espressif + patch AKA
         run: |
