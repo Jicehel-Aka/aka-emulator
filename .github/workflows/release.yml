@@ -84,7 +84,9 @@ jobs:
           cp -r sample front tools qemu-patch $D/
           cp dist-template/README.md $D/ ; cp dist-template/windows/* $D/
           cp aka-launcher.zip mode-emploi-launcher-aka.pdf $D/ 2>/dev/null || true
-          7z a -tzip $D.zip $D || zip -qr $D.zip $D
+      - name: Zip (PowerShell, natif Windows)
+        shell: pwsh
+        run: Compress-Archive -Path aka-emulator-windows-x64 -DestinationPath aka-emulator-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: aka-windows
