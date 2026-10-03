@@ -1,0 +1,4 @@
+aka-flash.bin
+*.o
+build*/
+qemu/

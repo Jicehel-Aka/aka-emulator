@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+jobs:
+  front-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y g++ libsdl2-dev
+      - name: Compile le front-end
+        run: g++ -O2 -std=c++17 -Wall front/main.cpp front/flashimg.cpp -o /tmp/aka-front $(sdl2-config --cflags --libs)
+  qemu-patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Le patch s'applique sur la base Espressif
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/espressif/qemu.git qemu
+          cd qemu && git checkout "$(cat ../qemu-patch/BASE_COMMIT)"
+          git apply --check ../qemu-patch/aka-qemu.patch

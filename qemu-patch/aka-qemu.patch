@@ -1,0 +1,2137 @@
+diff --git a/hw/block/m25p80.c b/hw/block/m25p80.c
+index 46dbe7c..f10a821 100644
+--- a/hw/block/m25p80.c
++++ b/hw/block/m25p80.c
+@@ -602,6 +602,40 @@ static inline void flash_sync_area(Flash *s, int64_t off, int64_t len)
+     blk_aio_pwritev(s->blk, off, iov, 0, blk_sync_complete, iov);
+ }
+ 
++/* AKA: live view of the flash storage for the ESP32-S3 cache model */
++bool aka_m25p80_read(uint32_t addr, uint8_t *buf, size_t len);
++static Flash *aka_flash_inst;
++uint64_t aka_flash_gen;
++uint32_t aka_flash_dlo = 0xffffffffu, aka_flash_dhi;
++
++uint8_t *aka_cache_flash_ram;
++uint64_t aka_cache_flash_size;
++
++static inline void aka_flash_dirty(uint32_t lo, uint32_t len)
++{
++    if (aka_cache_flash_ram && aka_flash_inst &&
++        (uint64_t) lo + len <= aka_cache_flash_size) {
++        memcpy(aka_cache_flash_ram + lo, aka_flash_inst->storage + lo, len);
++    }
++    aka_flash_gen++;
++    if (lo < aka_flash_dlo) {
++        aka_flash_dlo = lo;
++    }
++    if (lo + len > aka_flash_dhi) {
++        aka_flash_dhi = lo + len;
++    }
++}
++
++bool aka_m25p80_read(uint32_t addr, uint8_t *buf, size_t len)
++{
++    if (!aka_flash_inst || !aka_flash_inst->storage ||
++        (uint64_t) addr + len > aka_flash_inst->size) {
++        return false;
++    }
++    memcpy(buf, aka_flash_inst->storage + addr, len);
++    return true;
++}
++
+ static void flash_erase(Flash *s, int offset, FlashCMD cmd)
+ {
+     uint32_t len;
+@@ -651,6 +685,7 @@ static void flash_erase(Flash *s, int offset, FlashCMD cmd)
+         return;
+     }
+     memset(s->storage + offset, 0xff, len);
++    aka_flash_dirty(offset, len);
+     flash_sync_area(s, offset, len);
+ }
+ 
+@@ -706,6 +741,7 @@ void flash_write8(Flash *s, uint32_t addr, uint8_t data)
+     } else {
+         s->storage[s->cur_addr] &= data;
+     }
++    aka_flash_dirty(s->cur_addr, 1);
+ 
+     flash_sync_dirty(s, page);
+     s->dirty_page = page;
+@@ -820,6 +856,7 @@ static void complete_collecting_data(Flash *s)
+                 s->four_bytes_address_mode = extract32(s->data[1], 5, 1);
+             }
+             break;
++        case MAN_GIGADEVICE:
+         case MAN_WINBOND:
+             if (s->len > 1) {
+                 s->quad_enable = !!(s->data[1] & 0x02);
+@@ -834,6 +871,7 @@ static void complete_collecting_data(Flash *s)
+         break;
+     case WRSR2:
+         switch (get_man(s)) {
++        case MAN_GIGADEVICE:
+         case MAN_WINBOND:
+             s->quad_enable = !!(s->data[0] & 0x02);
+             break;
+@@ -1294,6 +1332,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
+             s->needed_bytes = 2;
+             s->state = STATE_COLLECTING_VAR_LEN_DATA;
+             break;
++        case MAN_GIGADEVICE:
+         case MAN_WINBOND:
+             s->needed_bytes = 2;
+             s->state = STATE_COLLECTING_VAR_LEN_DATA;
+@@ -1320,6 +1359,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
+         }
+ 
+         switch (get_man(s)) {
++        case MAN_GIGADEVICE:
+         case MAN_WINBOND:
+             s->needed_bytes = 1;
+             s->state = STATE_COLLECTING_DATA;
+@@ -1499,6 +1539,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
+         case MAN_MACRONIX:
+             s->quad_enable = true;
+             break;
++        case MAN_GIGADEVICE:
+         case MAN_WINBOND:
+             s->data[0] = (!!s->quad_enable) << 1;
+             s->pos = 0;
+@@ -1692,6 +1733,7 @@ static void m25p80_realize(SSIPeripheral *ss, Error **errp)
+ 
+         trace_m25p80_binding(s);
+         s->storage = blk_blockalign(s->blk, s->size);
++        aka_flash_inst = s;
+ 
+         if (!blk_check_size_and_read_all(s->blk, DEVICE(s),
+                                          s->storage, s->size, errp)) {
+diff --git a/hw/dma/esp_gdma.c b/hw/dma/esp_gdma.c
+index 6640fca..da92cca 100644
+--- a/hw/dma/esp_gdma.c
++++ b/hw/dma/esp_gdma.c
+@@ -178,7 +178,10 @@ static bool esp_gdma_write_descr(ESPGdmaState *s, uint32_t addr, GdmaLinkedList*
+  */
+ static bool esp_gdma_read_guest(ESPGdmaState *s, uint32_t addr, void* data, uint32_t len)
+ {
+-    MemTxResult res = dma_memory_read(&s->dma_as, addr, data, len, MEMTXATTRS_UNSPECIFIED);
++    /* External RAM (PSRAM through the data cache window) is not part of the
++     * DRAM-only DMA address space: go through the system address space. */
++    AddressSpace *as = (addr >= 0x3c000000 && addr < 0x3e000000) ? &address_space_memory : &s->dma_as;
++    MemTxResult res = dma_memory_read(as, addr, data, len, MEMTXATTRS_UNSPECIFIED);
+     return res == MEMTX_OK;
+ }
+ 
+@@ -277,7 +280,7 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
+     for (int i = 0; i < class->m_channel_count; i++) {
+         /* IN/OUT PERI registers have the same organization, can use any macro.
+          * Look for the channel that was configured with the given peripheral. It must be marked as "started" too */
+-        if ( FIELD_EX32(s->ch_conf[dir][i].peripheral, GDMA_PERI_SEL, PERI_SEL) == periph ||
++        if ( FIELD_EX32(s->ch_conf[dir][i].peripheral, GDMA_PERI_SEL, PERI_SEL) == periph &&
+              FIELD_EX32(s->ch_conf[dir][i].link, GDMA_OUT_LINK, START)) {
+ 
+             *chan = i;
+@@ -326,6 +329,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+      * On the real hardware, both in and out are checked at the same time, so in case of an error, both bits
+      * are set. Replicate the same behavior here. */
+     if ( !valid || (owner_check_out && !out_list.config.owner) ) {
++        fprintf(stderr, "[gdma] first desc bad valid=%d owner=%d addr=0x%x\n", valid, out_list.config.owner, out_addr);
+         esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
+         return false;
+     }
+@@ -342,6 +346,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+ 
+         valid = esp_gdma_read_guest(s, out_list.buf_addr, buffer + consumed, min);
+         if (!valid) {
++            fprintf(stderr, "[gdma] read_guest fail addr=0x%x len=%u consumed=%u\n", out_list.buf_addr, min, consumed);
+             esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
+             error = true;
+             break;
+@@ -372,6 +377,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+ 
+             /* Only check the valid flag and the owner if we don't have to exit the loop*/
+             if ( !exit_loop && (!valid || (owner_check_out && !out_list.config.owner)) ) {
++                fprintf(stderr, "[gdma] next node bad valid=%d owner=%d next=0x%x consumed=%u\n", valid, out_list.config.owner, out_addr, consumed);
+                 esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
+                 error = true;
+             }
+@@ -401,6 +407,77 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+ }
+ 
+ 
++bool esp_gdma_find_out_channel(ESPGdmaState *s, GdmaPeripheral periph, uint32_t *chan)
++{
++    const ESPGdmaClass *class = ESP_GDMA_GET_CLASS(s);
++
++    for (uint32_t i = 0; i < class->m_channel_count; i++) {
++        if (FIELD_EX32(s->ch_conf[ESP_GDMA_OUT_IDX][i].peripheral, GDMA_PERI_SEL, PERI_SEL) == periph) {
++            *chan = i;
++            return true;
++        }
++    }
++    return false;
++}
++
++bool esp_gdma_out_take_start(ESPGdmaState *s, uint32_t chan)
++{
++    DmaConfigState *state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
++
++    if (FIELD_EX32(state->link, GDMA_OUT_LINK, START)) {
++        state->link &= R_GDMA_OUT_LINK_ADDR_MASK;           /* clear START/RESTART */
++        state->stream_desc = ((ESP_GDMA_RAM_ADDR >> 20) << 20) | FIELD_EX32(state->link, GDMA_OUT_LINK, ADDR);
++        state->stream_off = 0;
++        state->stream_active = true;
++        return true;
++    }
++    return false;
++}
++
++uint32_t esp_gdma_out_stream(ESPGdmaState *s, uint32_t chan, uint8_t *buffer, uint32_t size)
++{
++    DmaConfigState *state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
++    uint32_t produced = 0;
++
++    if (!state->stream_active) {
++        return 0;
++    }
++    while (produced < size) {
++        GdmaLinkedList node;
++
++        if (!esp_gdma_read_descr(s, state->stream_desc, &node) || !node.config.owner) {
++            state->stream_active = false;       /* chain ended or descriptor error */
++            break;
++        }
++        const uint32_t avail = node.config.length - state->stream_off;
++        const uint32_t n = MIN(avail, size - produced);
++
++        if (n && !esp_gdma_read_guest(s, node.buf_addr + state->stream_off, buffer + produced, n)) {
++            esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
++            state->stream_active = false;
++            break;
++        }
++        produced += n;
++        state->stream_off += n;
++        if (state->stream_off >= node.config.length) {
++            if (node.config.suc_eof) {
++                state->suc_eof_desc_addr = state->stream_desc;
++                esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_EOF_MASK |
++                                                       R_GDMA_INTERRUPT_OUT_DONE_MASK);
++            }
++            esp_gdma_push_descriptor(s, chan, ESP_GDMA_OUT_IDX, node.next_addr);
++            state->stream_desc = node.next_addr;
++            state->stream_off = 0;
++            if (!node.next_addr) {
++                state->stream_active = false;   /* end of a non circular list: total EOF */
++                esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_TOTAL_EOF_MASK);
++                break;
++            }
++        }
++    }
++    return produced;
++}
++
+ /**
+  * @brief Write data to the guest RAM pointed by the linked list configured in the given DmaConfigState index.
+  *        `size` bytes from `buffer` will be written to guest machine's RAM.
+@@ -1021,3 +1098,26 @@ static void esp_gdma_register_types(void)
+ }
+ 
+ type_init(esp_gdma_register_types)
++
++
++uint32_t esp_gdma_out_chain_length(ESPGdmaState *s, uint32_t chan)
++{
++    DmaConfigState* state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
++    uint32_t addr = ((ESP_GDMA_RAM_ADDR >> 20) << 20) |
++                    FIELD_EX32(state->link, GDMA_OUT_LINK, ADDR);
++    uint32_t total = 0;
++
++    /* Walk the transmit list until the descriptor flagged EOF (bounded) */
++    for (int node = 0; node < 8192; node++) {
++        GdmaLinkedList desc;
++        if (!esp_gdma_read_descr(s, addr, &desc)) {
++            break;
++        }
++        total += desc.config.length;
++        if (desc.config.suc_eof || desc.next_addr == 0) {
++            break;
++        }
++        addr = desc.next_addr;
++    }
++    return total;
++}
+diff --git a/hw/gpio/esp32_gpio.c b/hw/gpio/esp32_gpio.c
+index 4fea1f5..17e379d 100644
+--- a/hw/gpio/esp32_gpio.c
++++ b/hw/gpio/esp32_gpio.c
+@@ -16,6 +16,7 @@
+ #include "hw/sysbus.h"
+ #include "hw/registerfields.h"
+ #include "hw/irq.h"
++#include "qemu/timer.h"
+ #include "hw/qdev-properties.h"
+ #include "hw/gpio/esp32_gpio.h"
+ 
+@@ -30,6 +31,13 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+         r = s->strap_mode;
+         break;
+ 
++    case 0x40:  /* GPIO_IN1_REG: pins 32..53 */
++        /* AKA: GPIO47 = LCD FMARK/TE, emulate a 60 Hz square wave (50% duty) */
++        if ((qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) % 16667) < 8333) {
++            r |= 1u << (47 - 32);
++        }
++        break;
++
+     default:
+         break;
+     }
+diff --git a/hw/i2c/esp32_i2c.c b/hw/i2c/esp32_i2c.c
+index 5f4022f..781781b 100644
+--- a/hw/i2c/esp32_i2c.c
++++ b/hw/i2c/esp32_i2c.c
+@@ -3,6 +3,7 @@
+ #include "qemu/module.h"
+ #include "qemu/error-report.h"
+ #include "hw/i2c/esp32_i2c.h"
++#include "hw/qdev-properties.h"
+ #include "hw/irq.h"
+ 
+ static void esp32_i2c_do_transaction(Esp32I2CState * s);
+@@ -178,6 +179,14 @@ static void esp32_i2c_do_transaction(Esp32I2CState * s)
+     for (int i_cmd = 0; i_cmd < ESP32_I2C_CMD_COUNT && !stop_or_end; ++i_cmd) {
+         uint32_t cmd = s->cmd_reg[i_cmd];
+         char opcode = FIELD_EX32(cmd, I2C_CMD, OPCODE);
++        if (s->s3_opcodes) {
++            switch (opcode) {
++            case 6: opcode = I2C_OPCODE_RSTART; break;
++            case 3: opcode = I2C_OPCODE_READ; break;
++            case 2: opcode = I2C_OPCODE_STOP; break;
++            default: break;   /* WRITE=1 and END=4 are identical */
++            }
++        }
+         switch (opcode) {
+             case I2C_OPCODE_RSTART:
+                 i2c_end_transfer(s->bus);
+@@ -232,7 +241,7 @@ static void esp32_i2c_do_transaction(Esp32I2CState * s)
+                 stop_or_end = true;
+                 break;
+             default:
+-                error_report("esp32_i2c: Invalid command %d opcode %d", i_cmd, opcode);
++                error_report("esp32_i2c: Invalid command %d opcode %d (s3=%d cmd=0x%08x)", i_cmd, opcode, s->s3_opcodes, cmd);
+                 break;
+         }
+         s->cmd_reg[i_cmd] = FIELD_DP32(s->cmd_reg[i_cmd], I2C_CMD, DONE, 1);
+@@ -261,8 +270,14 @@ static void esp32_i2c_init(Object * obj)
+     fifo8_create(&s->rx_fifo, ESP32_I2C_FIFO_LENGTH);
+ }
+ 
++static Property esp32_i2c_props[] = {
++    DEFINE_PROP_BOOL("s3-opcodes", Esp32I2CState, s3_opcodes, false),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
+ static void esp32_i2c_class_init(ObjectClass * klass, void * data)
+ {
++    device_class_set_props(DEVICE_CLASS(klass), esp32_i2c_props);
+     ResettableClass *rc = RESETTABLE_CLASS(klass);
+     rc->phases.hold = esp32_i2c_reset_hold;
+ }
+diff --git a/hw/misc/aka_i2c_dev.c b/hw/misc/aka_i2c_dev.c
+new file mode 100644
+index 0000000..18db0a1
+--- /dev/null
++++ b/hw/misc/aka_i2c_dev.c
+@@ -0,0 +1,202 @@
++/*
++ * Gamebuino AKA - I2C slaves (button expanders, TAS2505 stub)
++ *
++ * GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qapi/error.h"
++#include "hw/misc/aka_shm.h"
++#include <sys/stat.h>
++#include "hw/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "hw/misc/aka_i2c_dev.h"
++
++/* Same masks as gb_ll_common.h */
++#define K_RUN    0x0002
++#define K_MENU   0x0004
++#define K_R1     0x0040
++#define K_L1     0x0080
++
++static const AkaInputShared aka_input_idle = { .magic = AKA_INPUT_MAGIC,
++    .joyx_mv = 1650, .joyy_mv = 1650, .battery_mv = 3900 };
++
++const volatile AkaInputShared *aka_input_map(const char *path)
++{
++    if (!path || !*path) {
++        return NULL;
++    }
++    void *p = aka_shm_map(path, sizeof(AkaInputShared), true);
++    if (!p) {
++        return NULL;
++    }
++    AkaInputShared *in = p;
++    if (in->magic != AKA_INPUT_MAGIC) {      /* freshly created file */
++        *in = aka_input_idle;
++    }
++    return in;
++}
++
++/* ------------------------------------------------------------------ */
++/* PCF8574-like expander                                               */
++/* ------------------------------------------------------------------ */
++
++typedef struct AkaExpanderState {
++    I2CSlave parent_obj;
++    uint8_t out;                      /* last byte written (pins driven high) */
++    uint32_t half;                    /* 0: low byte (0x38), 1: high byte (0x3F) */
++    char *input_path;
++    const volatile AkaInputShared *in;
++} AkaExpanderState;
++
++OBJECT_DECLARE_SIMPLE_TYPE(AkaExpanderState, AKA_EXPANDER)
++
++static uint8_t aka_expander_pins(AkaExpanderState *s)
++{
++    const uint32_t keys = s->in ? s->in->keys : 0;
++
++    if (s->half) {
++        /* all keys active low, pulled up */
++        return (uint8_t)(0xFF & ~(keys >> 8));
++    } else {
++        uint8_t v = s->out | (K_MENU | K_R1 | K_L1);
++        v &= ~(keys & (K_MENU | K_R1 | K_L1));
++        /* RUN is active high: low when released, high when pressed */
++        v &= ~K_RUN;
++        if (keys & K_RUN) {
++            v |= K_RUN;
++        }
++        return v;
++    }
++}
++
++static int aka_expander_event(I2CSlave *i2c, enum i2c_event event)
++{
++    return 0;
++}
++
++static uint8_t aka_expander_recv(I2CSlave *i2c)
++{
++    return aka_expander_pins(AKA_EXPANDER(i2c));
++}
++
++static int aka_expander_send(I2CSlave *i2c, uint8_t data)
++{
++    AKA_EXPANDER(i2c)->out = data;
++    return 0;
++}
++
++static void aka_expander_realize(DeviceState *dev, Error **errp)
++{
++    AkaExpanderState *s = AKA_EXPANDER(dev);
++
++    s->out = 0xff;
++    s->in = aka_input_map(s->input_path);
++}
++
++static Property aka_expander_props[] = {
++    DEFINE_PROP_UINT32("half", AkaExpanderState, half, 0),
++    DEFINE_PROP_STRING("input-path", AkaExpanderState, input_path),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void aka_expander_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    dc->realize = aka_expander_realize;
++    device_class_set_props(dc, aka_expander_props);
++    k->event = aka_expander_event;
++    k->recv = aka_expander_recv;
++    k->send = aka_expander_send;
++}
++
++static const TypeInfo aka_expander_info = {
++    .name = TYPE_AKA_EXPANDER,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(AkaExpanderState),
++    .class_init = aka_expander_class_init,
++};
++
++/* ------------------------------------------------------------------ */
++/* TAS2505 stub: paged register file, status bits report "powered/ready" */
++/* ------------------------------------------------------------------ */
++
++typedef struct AkaTas2505State {
++    I2CSlave parent_obj;
++    uint8_t regs[256][128];
++    uint8_t page;
++    uint8_t reg;
++    int pos;                          /* bytes received in current write */
++} AkaTas2505State;
++
++OBJECT_DECLARE_SIMPLE_TYPE(AkaTas2505State, AKA_TAS2505)
++
++static int aka_tas_event(I2CSlave *i2c, enum i2c_event event)
++{
++    AkaTas2505State *s = AKA_TAS2505(i2c);
++
++    if (event == I2C_START_SEND) {
++        s->pos = 0;
++    }
++    return 0;
++}
++
++static int aka_tas_send(I2CSlave *i2c, uint8_t data)
++{
++    AkaTas2505State *s = AKA_TAS2505(i2c);
++
++    if (s->pos == 0) {
++        s->reg = data & 0x7f;
++    } else {
++        if (s->reg == 0) {               /* register 0: page select */
++            s->page = data;
++        } else {
++            s->regs[s->page][s->reg & 0x7f] = data;
++        }
++        s->reg = (s->reg + 1) & 0x7f;
++    }
++    s->pos++;
++    return 0;
++}
++
++static uint8_t aka_tas_recv(I2CSlave *i2c)
++{
++    AkaTas2505State *s = AKA_TAS2505(i2c);
++    uint8_t v;
++
++    if (s->reg == 0) {
++        v = s->page;
++    } else if (s->page == 0 && (s->reg == 0x24 || s->reg == 0x26)) {
++        v = 0xff;                         /* DAC/PGA flags: powered and settled */
++    } else {
++        v = s->regs[s->page][s->reg & 0x7f];
++    }
++    s->reg = (s->reg + 1) & 0x7f;
++    return v;
++}
++
++static void aka_tas_class_init(ObjectClass *klass, void *data)
++{
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    k->event = aka_tas_event;
++    k->recv = aka_tas_recv;
++    k->send = aka_tas_send;
++}
++
++static const TypeInfo aka_tas_info = {
++    .name = TYPE_AKA_TAS2505,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(AkaTas2505State),
++    .class_init = aka_tas_class_init,
++};
++
++static void aka_i2c_dev_register_types(void)
++{
++    type_register_static(&aka_expander_info);
++    type_register_static(&aka_tas_info);
++}
++
++type_init(aka_i2c_dev_register_types)
+diff --git a/hw/misc/aka_i2s.c b/hw/misc/aka_i2s.c
+new file mode 100644
+index 0000000..018583f
+--- /dev/null
++++ b/hw/misc/aka_i2s.c
+@@ -0,0 +1,200 @@
++/*
++ * Gamebuino AKA - ESP32-S3 I2S TX streaming (see aka_i2s.h)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "hw/qdev-properties.h"
++#include "hw/misc/aka_i2s.h"
++#include "hw/misc/aka_shm.h"
++
++#define I2S_TX_CONF        0x24
++#define I2S_TX_CONF1       0x2C
++#define I2S_TX_CLKM_CONF   0x34
++#define I2S_TX_CLKM_DIV    0x3C
++#define TX_RESET           (1u << 0)
++#define TX_START           (1u << 2)
++
++#define TICK_NS            (2 * 1000 * 1000)    /* 2 ms */
++
++static AkaAudioShared *aka_audio_map(const char *path)
++{
++    if (!path || !*path) {
++        return NULL;
++    }
++    return aka_shm_map(path, sizeof(AkaAudioShared), true);
++}
++
++/* Sample rate (frames/s) from the clock registers, or the default when it looks wrong. */
++static uint32_t aka_i2s_rate(AkaI2sState *s)
++{
++    const uint32_t clkm = s->regs[I2S_TX_CLKM_CONF / 4];
++    const uint32_t div = s->regs[I2S_TX_CLKM_DIV / 4];
++    const uint32_t conf1 = s->regs[I2S_TX_CONF1 / 4];
++    static const double src[4] = { 40e6, 120e6, 160e6, 0 };
++    const double fsrc = src[(clkm >> 27) & 3];
++    const uint32_t n = clkm & 0xFF;
++    const uint32_t z = div & 0x1FF, y = (div >> 9) & 0x1FF, x = (div >> 18) & 0x1FF;
++    const uint32_t bck = (conf1 >> 7) & 0x3F;
++    const uint32_t bits = ((conf1 >> 19) & 0x1F) + 1;
++
++    if (fsrc > 0 && n > 0 && bck > 0 && bits > 0) {
++        /* fractional divider N + y/x ... (x == 0 : integer) */
++        double d = n;
++        if (x && z) {
++            d += (y && y <= x) ? (double) z / x : 0;   /* approximation, validated below */
++        }
++        const double rate = fsrc / d / bck / (2.0 * bits);
++        if (rate > 7000 && rate < 100000) {
++            return (uint32_t) rate;
++        }
++    }
++    return s->default_rate;
++}
++
++static void aka_i2s_tick(void *opaque)
++{
++    AkaI2sState *s = opaque;
++    const int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (!s->have_chan && !esp_gdma_find_out_channel(s->gdma, s->periph, &s->chan)) {
++        goto next;
++    }
++    s->have_chan = true;
++    esp_gdma_out_take_start(s->gdma, s->chan);
++
++    if (s->running) {
++        const uint32_t rate = aka_i2s_rate(s);
++        s->frac += (double) (now - s->last_ns) * rate / 1e9;
++        uint32_t frames = (uint32_t) s->frac;
++        s->frac -= frames;
++        while (frames) {
++            int16_t buf[512];
++            const uint32_t chunk = MIN(frames, 512u);
++            const uint32_t got = esp_gdma_out_stream(s->gdma, s->chan, (uint8_t *) buf, chunk * 2) / 2;
++
++            if (!got) {
++                break;                      /* nothing queued: under-run, leave the ring idle */
++            }
++            if (s->out) {
++                uint32_t wp = s->out->write_pos;
++                for (uint32_t i = 0; i < got; i++) {
++                    s->out->ring[(wp + i) % AKA_AUDIO_RING_FRAMES] = buf[i];
++                }
++                s->out->rate = rate;
++                __atomic_store_n(&s->out->write_pos, wp + got, __ATOMIC_RELEASE);
++            }
++            frames -= got;
++        }
++    }
++    s->last_ns = now;
++next:
++    timer_mod(&s->timer, now + TICK_NS);
++}
++
++static uint64_t aka_i2s_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    AkaI2sState *s = AKA_I2S(opaque);
++
++    return addr < AKA_I2S_SIZE ? s->regs[addr / 4] : 0;
++}
++
++static void aka_i2s_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
++{
++    AkaI2sState *s = AKA_I2S(opaque);
++
++    if (addr >= AKA_I2S_SIZE) {
++        return;
++    }
++    s->regs[addr / 4] = (uint32_t) value;
++    if (getenv("AKA_I2S_LOG")) {
++        fprintf(stderr, "[i2s%u] W 0x%03lx = 0x%08lx\n", s->periph, (unsigned long) addr, (unsigned long) value);
++    }
++    if (addr == 0x20) {
++        s->regs[addr / 4] &= ~(1u << 8);     /* RX_UPDATE self clearing */
++    }
++    if (addr == I2S_TX_CONF) {
++        s->regs[addr / 4] &= ~(TX_RESET | (1u << 8));      /* TX_RESET / TX_UPDATE self clearing */
++        const bool start = value & TX_START;
++        if (start && !s->out) {
++            s->out = aka_audio_map(s->audio_path);
++            if (s->out) {
++                s->out->magic = AKA_AUDIO_MAGIC;
++                s->out->channels = 1;
++                s->out->ring_frames = AKA_AUDIO_RING_FRAMES;
++                s->out->rate = s->default_rate;
++                s->out->write_pos = 0;
++            }
++        }
++        if (start && !s->running) {
++            s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++            s->frac = 0;
++        }
++        s->running = start;
++    }
++}
++
++static const MemoryRegionOps aka_i2s_ops = {
++    .read = aka_i2s_read,
++    .write = aka_i2s_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void aka_i2s_init(Object *obj)
++{
++    AkaI2sState *s = AKA_I2S(obj);
++
++    memory_region_init_io(&s->iomem, obj, &aka_i2s_ops, s, TYPE_AKA_I2S, AKA_I2S_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++}
++
++static void aka_i2s_realize(DeviceState *dev, Error **errp)
++{
++    AkaI2sState *s = AKA_I2S(dev);
++
++    if (!s->gdma) {
++        error_setg(errp, "aka.i2s: gdma link must be set");
++        return;
++    }
++    timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, aka_i2s_tick, s);
++    timer_mod(&s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TICK_NS);
++}
++
++static Property aka_i2s_props[] = {
++    DEFINE_PROP_LINK("gdma", AkaI2sState, gdma, TYPE_ESP_GDMA, ESPGdmaState *),
++    DEFINE_PROP_UINT32("periph", AkaI2sState, periph, GDMA_I2S0),
++    DEFINE_PROP_STRING("audio-path", AkaI2sState, audio_path),
++    DEFINE_PROP_UINT32("default-rate", AkaI2sState, default_rate, 44100),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void aka_i2s_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = aka_i2s_realize;
++    device_class_set_props(dc, aka_i2s_props);
++}
++
++static const TypeInfo aka_i2s_info = {
++    .name = TYPE_AKA_I2S,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(AkaI2sState),
++    .instance_init = aka_i2s_init,
++    .class_init = aka_i2s_class_init,
++};
++
++static void aka_i2s_register_types(void)
++{
++    type_register_static(&aka_i2s_info);
++}
++
++type_init(aka_i2s_register_types)
+diff --git a/hw/misc/aka_lcdcam.c b/hw/misc/aka_lcdcam.c
+new file mode 100644
+index 0000000..9a312c8
+--- /dev/null
++++ b/hw/misc/aka_lcdcam.c
+@@ -0,0 +1,509 @@
++/*
++ * Gamebuino AKA - ESP32-S3 LCD_CAM (i8080 LCD mode) + ST7789V panel
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/error-report.h"
++#include "qapi/error.h"
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/misc/aka_lcdcam.h"
++#include "hw/misc/aka_shm.h"
++
++/* LCD_CAM registers (offsets) used by the esp_lcd i80 driver */
++#define REG_LCD_USER        0x14
++#define REG_LCD_MISC        0x18
++#define REG_LCD_CMD_VAL     0x28
++#define REG_INT_ENA         0x64
++#define REG_INT_RAW         0x68
++#define REG_INT_ST          0x6c
++#define REG_INT_CLR         0x70
++
++/* LCD_USER bits */
++#define USER_2BYTE_EN       (1u << 23)
++#define USER_8BITS_ORDER    (1u << 19)
++#define USER_UPDATE         (1u << 20)
++#define USER_BIT_ORDER      (1u << 21)
++#define USER_DOUT           (1u << 24)
++#define USER_CMD            (1u << 26)
++#define USER_START          (1u << 27)
++#define USER_RESET          (1u << 28)
++#define USER_CMD_2_CYCLE    (1u << 31)
++
++/* LCD_MISC bits */
++#define MISC_AFIFO_RESET    (1u << 27)
++#define MISC_CD_DATA_SET    (1u << 28)
++#define MISC_CD_CMD_SET     (1u << 30)
++#define MISC_CD_IDLE_EDGE   (1u << 31)
++
++#define INT_TRANS_DONE      (1u << 1)
++
++/* ST7789V commands / MADCTL bits */
++#define ST_SWRESET  0x01
++#define ST_SLPIN    0x10
++#define ST_SLPOUT   0x11
++#define ST_INVOFF   0x20
++#define ST_INVON    0x21
++#define ST_DISPOFF  0x28
++#define ST_DISPON   0x29
++#define ST_CASET    0x2a
++#define ST_RASET    0x2b
++#define ST_RAMWR    0x2c
++#define ST_MADCTL   0x36
++#define ST_COLMOD   0x3a
++
++#define MADCTL_MV   0x20
++#define MADCTL_MX   0x40
++#define MADCTL_MY   0x80
++#define MADCTL_BGR  0x08
++
++static bool aka_lcd_debug(void)
++{
++    static int dbg = -1;
++
++    if (dbg < 0) {
++        dbg = getenv("AKA_LCD_DEBUG") ? 1 : 0;
++    }
++    return dbg;
++}
++
++/* ------------------------------------------------------------------ */
++/* Shared framebuffer                                                  */
++/* ------------------------------------------------------------------ */
++
++static uint16_t *aka_fb_pixels(AkaLcdCamState *s)
++{
++    return s->fb ? (uint16_t *)(s->fb + AKA_FB_HEADER_SIZE) : s->local_fb;
++}
++
++static void aka_fb_publish(AkaLcdCamState *s)
++{
++    if (!s->fb) {
++        return;
++    }
++    stl_le_p(s->fb + 0x00, AKA_FB_MAGIC);
++    stl_le_p(s->fb + 0x04, AKA_FB_VERSION);
++    stl_le_p(s->fb + 0x08, s->width);
++    stl_le_p(s->fb + 0x0c, s->height);
++    stl_le_p(s->fb + 0x10, s->frame_count);
++    stl_le_p(s->fb + 0x14, s->flags);
++}
++
++static void aka_panel_set_orientation(AkaLcdCamState *s)
++{
++    uint32_t w = (s->madctl & MADCTL_MV) ? 320 : 240;
++    uint32_t h = (s->madctl & MADCTL_MV) ? 240 : 320;
++
++    if (w != s->width || h != s->height) {
++        s->width = w;
++        s->height = h;
++        memset(aka_fb_pixels(s), 0, AKA_FB_MAX_DIM * AKA_FB_MAX_DIM * 2);
++    }
++    if (s->madctl & MADCTL_BGR) {
++        s->flags |= AKA_FB_FLAG_BGR;
++    } else {
++        s->flags &= ~AKA_FB_FLAG_BGR;
++    }
++    aka_fb_publish(s);
++}
++
++static void aka_panel_reset(AkaLcdCamState *s)
++{
++    s->cur_cmd = 0;
++    s->param_cnt = 0;
++    s->pix_have_hi = false;
++    s->madctl = 0;
++    s->colmod = 0x66;
++    s->flags = 0;
++    s->col_start = 0;
++    s->col_end = 239;
++    s->row_start = 0;
++    s->row_end = 319;
++    s->cur_x = 0;
++    s->cur_y = 0;
++    s->width = 0; /* force a clear in set_orientation */
++    s->height = 0;
++    aka_panel_set_orientation(s);
++}
++
++static void aka_panel_put_pixel(AkaLcdCamState *s, uint16_t pix)
++{
++    const bool mv = s->madctl & MADCTL_MV;
++    /*
++     * Display-space model: with MV=1, MX=1, MY=0 (the rotation used by the
++     * Gamebuino AKA library) the image is upright; every other combination is
++     * a mirror relative to that reference.
++     */
++    const bool flip_x = mv ? !(s->madctl & MADCTL_MX) : !!(s->madctl & MADCTL_MX);
++    const bool flip_y = !!(s->madctl & MADCTL_MY);
++    uint32_t x = flip_x ? (s->width - 1 - s->cur_x) : s->cur_x;
++    uint32_t y = flip_y ? (s->height - 1 - s->cur_y) : s->cur_y;
++
++    if (s->cur_x < s->width && s->cur_y < s->height) {
++        aka_fb_pixels(s)[y * s->width + x] = pix;
++    }
++    if (++s->cur_x > s->col_end) {
++        s->cur_x = s->col_start;
++        if (++s->cur_y > s->row_end) {
++            s->cur_y = s->row_start;
++        }
++    }
++}
++
++static void aka_panel_command(AkaLcdCamState *s, uint8_t cmd)
++{
++    s->cur_cmd = cmd;
++    s->param_cnt = 0;
++
++    switch (cmd) {
++    case ST_SWRESET:
++        aka_panel_reset(s);
++        break;
++    case ST_SLPIN:
++        s->flags &= ~AKA_FB_FLAG_SLEEP_OUT;
++        break;
++    case ST_SLPOUT:
++        s->flags |= AKA_FB_FLAG_SLEEP_OUT;
++        break;
++    case ST_INVOFF:
++        s->flags &= ~AKA_FB_FLAG_INVERSION;
++        break;
++    case ST_INVON:
++        s->flags |= AKA_FB_FLAG_INVERSION;
++        break;
++    case ST_DISPOFF:
++        s->flags &= ~AKA_FB_FLAG_DISPLAY_ON;
++        break;
++    case ST_DISPON:
++        s->flags |= AKA_FB_FLAG_DISPLAY_ON;
++        break;
++    case ST_RAMWR:
++        s->cur_x = s->col_start;
++        s->cur_y = s->row_start;
++        s->pix_have_hi = false;
++        break;
++    default:
++        break;
++    }
++    aka_fb_publish(s);
++}
++
++static void aka_panel_data(AkaLcdCamState *s, uint8_t b)
++{
++    switch (s->cur_cmd) {
++    case ST_CASET:
++    case ST_RASET:
++        s->param_buf[s->param_cnt & 3] = b;
++        s->param_cnt++;
++        if (s->param_cnt == 2 || s->param_cnt == 4) {
++            uint16_t v = (s->param_buf[(s->param_cnt - 2) & 3] << 8) |
++                         s->param_buf[(s->param_cnt - 1) & 3];
++            if (s->cur_cmd == ST_CASET) {
++                if (s->param_cnt == 2) {
++                    s->col_start = v;
++                } else {
++                    s->col_end = v;
++                }
++            } else {
++                if (s->param_cnt == 2) {
++                    s->row_start = v;
++                } else {
++                    s->row_end = v;
++                }
++            }
++        }
++        break;
++    case ST_MADCTL:
++        s->madctl = b;
++        aka_panel_set_orientation(s);
++        break;
++    case ST_COLMOD:
++        s->colmod = b;
++        break;
++    case ST_RAMWR:
++        if (!s->pix_have_hi) {
++            s->pix_hi = b;
++            s->pix_have_hi = true;
++        } else {
++            aka_panel_put_pixel(s, (s->pix_hi << 8) | b);
++            s->pix_have_hi = false;
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* LCD_CAM controller                                                  */
++/* ------------------------------------------------------------------ */
++
++static void aka_lcdcam_update_irq(AkaLcdCamState *s)
++{
++    qemu_set_irq(s->irq, (s->int_raw & s->int_ena) ? 1 : 0);
++}
++
++static inline uint8_t reverse_bits8(uint8_t v)
++{
++    v = (v >> 4) | (v << 4);
++    v = ((v & 0xcc) >> 2) | ((v & 0x33) << 2);
++    v = ((v & 0xaa) >> 1) | ((v & 0x55) << 1);
++    return v;
++}
++
++static void aka_lcdcam_done(void *opaque)
++{
++    AkaLcdCamState *s = opaque;
++
++    if (aka_lcd_debug()) {
++        fprintf(stderr, "[lcdcam] done (ena=0x%x)\n", s->int_ena);
++    }
++    s->busy = false;
++    s->regs[REG_LCD_USER / 4] &= ~USER_START;
++    s->int_raw |= INT_TRANS_DONE;
++    aka_lcdcam_update_irq(s);
++}
++
++static void aka_lcdcam_start(AkaLcdCamState *s)
++{
++    const uint32_t user = s->regs[REG_LCD_USER / 4];
++    const uint32_t misc = s->regs[REG_LCD_MISC / 4];
++    const bool dc_idle = !!(misc & MISC_CD_IDLE_EDGE);
++    const bool dc_cmd = dc_idle ^ !!(misc & MISC_CD_CMD_SET);
++    const bool dc_data = dc_idle ^ !!(misc & MISC_CD_DATA_SET);
++    uint32_t nbytes = 0;
++
++    if (aka_lcd_debug()) {
++        fprintf(stderr, "[lcdcam] start user=0x%08x misc=0x%08x cmdval=0x%08x\n",
++                user, misc, s->regs[REG_LCD_CMD_VAL / 4]);
++    }
++
++    if (user & USER_CMD) {
++        const uint32_t v = s->regs[REG_LCD_CMD_VAL / 4];
++        const int cycles = (user & USER_CMD_2_CYCLE) ? 2 : 1;
++
++        for (int i = 0; i < cycles; i++) {
++            /* 8-bit bus: cycle 0 sends value[7:0], cycle 1 value[23:16] */
++            uint8_t b = (i == 0) ? (v & 0xff) : ((v >> 16) & 0xff);
++            if (dc_cmd) {
++                aka_panel_data(s, b);
++            } else {
++                aka_panel_command(s, b);
++            }
++            nbytes++;
++        }
++    }
++
++    if ((user & USER_DOUT) && s->gdma) {
++        uint32_t chan;
++
++        if (esp_gdma_get_channel_periph(s->gdma, GDMA_LCDCAM,
++                                        ESP_GDMA_OUT_IDX, &chan)) {
++            uint32_t len = esp_gdma_out_chain_length(s->gdma, chan);
++            if (aka_lcd_debug()) {
++                fprintf(stderr, "[lcdcam]   data phase chan=%u len=%u cur_cmd=0x%02x\n",
++                        chan, len, s->cur_cmd);
++            }
++            uint8_t *buf = g_malloc(len ? len : 1);
++
++            if (len && esp_gdma_read_channel(s->gdma, chan, buf, len)) {
++                const bool swap_pairs = (user & USER_8BITS_ORDER) &&
++                                        !(user & USER_2BYTE_EN);
++                const bool rev_bits = !!(user & USER_BIT_ORDER);
++                const bool is_frame = (s->cur_cmd == ST_RAMWR);
++
++                uint32_t i = 0;
++                if (dc_data && is_frame && !rev_bits && !s->pix_have_hi) {
++                    /* fast path: whole pixels straight into the framebuffer */
++                    for (; i + 1 < len; i += 2) {
++                        uint8_t hi = swap_pairs ? buf[i + 1] : buf[i];
++                        uint8_t lo = swap_pairs ? buf[i] : buf[i + 1];
++                        aka_panel_put_pixel(s, (hi << 8) | lo);
++                    }
++                }
++                for (; i < len; i++) {
++                    uint32_t idx = i;
++                    if (swap_pairs && (i | 1) < len) {
++                        idx = i ^ 1;
++                    }
++                    uint8_t b = buf[idx];
++                    if (rev_bits) {
++                        b = reverse_bits8(b);
++                    }
++                    if (dc_data) {
++                        aka_panel_data(s, b);
++                    } else {
++                        aka_panel_command(s, b);
++                    }
++                }
++                nbytes += len;
++                if (is_frame) {
++                    s->frame_count++;
++                    aka_fb_publish(s);
++                }
++            }
++            g_free(buf);
++        }
++    }
++
++    /* 8-bit bus at ~20 MHz: ~50 ns per byte, plus a small fixed latency */
++    s->busy = true;
++    timer_mod(s->done_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                             5000 + (int64_t)nbytes * 50);
++}
++
++static uint64_t aka_lcdcam_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    AkaLcdCamState *s = opaque;
++
++    if (aka_lcd_debug() && (addr == REG_INT_ST || addr == REG_INT_RAW)) {
++        fprintf(stderr, "[lcdcam] R 0x%02x raw=%x ena=%x\n", (unsigned)addr, s->int_raw, s->int_ena);
++    }
++    switch (addr) {
++    case REG_INT_ENA:
++        return s->int_ena;
++    case REG_INT_RAW:
++        return s->int_raw;
++    case REG_INT_ST:
++        return s->int_raw & s->int_ena;
++    case REG_LCD_USER:
++        return (s->regs[addr / 4] & ~USER_START) | (s->busy ? USER_START : 0);
++    default:
++        return addr < AKA_LCDCAM_SIZE ? s->regs[addr / 4] : 0;
++    }
++}
++
++static void aka_lcdcam_write(void *opaque, hwaddr addr, uint64_t value,
++                             unsigned int size)
++{
++    AkaLcdCamState *s = opaque;
++    const uint32_t v = (uint32_t)value;
++
++    if (aka_lcd_debug()) {
++        fprintf(stderr, "[lcdcam] W 0x%02x = 0x%08x (busy=%d)\n", (unsigned)addr, v, s->busy);
++    }
++
++    switch (addr) {
++    case REG_INT_ENA:
++        s->int_ena = v & 0xf;
++        aka_lcdcam_update_irq(s);
++        break;
++    case REG_INT_CLR:
++        s->int_raw &= ~(v & 0xf);
++        aka_lcdcam_update_irq(s);
++        break;
++    case REG_LCD_USER: {
++        const bool was_started = s->busy;
++        uint32_t nv = v & ~(USER_UPDATE | USER_RESET);   /* self-clearing */
++
++        if (v & USER_RESET) {
++            timer_del(s->done_timer);
++            s->busy = false;
++            nv &= ~USER_START;
++        }
++        s->regs[addr / 4] = nv;
++        if ((nv & USER_START) && !was_started) {
++            aka_lcdcam_start(s);
++        } else if (!(nv & USER_START) && was_started) {
++            /* lcd_ll_stop(): the done interrupt is still delivered */
++        }
++        break;
++    }
++    case REG_LCD_MISC:
++        s->regs[addr / 4] = v & ~MISC_AFIFO_RESET;       /* self-clearing */
++        break;
++    default:
++        if (addr < AKA_LCDCAM_SIZE) {
++            s->regs[addr / 4] = v;
++        }
++        break;
++    }
++}
++
++static const MemoryRegionOps aka_lcdcam_ops = {
++    .read = aka_lcdcam_read,
++    .write = aka_lcdcam_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void aka_lcdcam_reset(DeviceState *dev)
++{
++    AkaLcdCamState *s = AKA_LCDCAM(dev);
++
++    timer_del(s->done_timer);
++    memset(s->regs, 0, sizeof(s->regs));
++    s->int_raw = 0;
++    s->int_ena = 0;
++    s->busy = false;
++    aka_lcdcam_update_irq(s);
++    aka_panel_reset(s);
++}
++
++static void aka_lcdcam_init(Object *obj)
++{
++    AkaLcdCamState *s = AKA_LCDCAM(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &aka_lcdcam_ops, s,
++                          TYPE_AKA_LCDCAM, AKA_LCDCAM_SIZE);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++}
++
++static void aka_lcdcam_realize(DeviceState *dev, Error **errp)
++{
++    AkaLcdCamState *s = AKA_LCDCAM(dev);
++
++    s->done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, aka_lcdcam_done, s);
++
++    if (s->fb_path && s->fb_path[0]) {
++        void *p = aka_shm_map(s->fb_path, AKA_FB_FILE_SIZE, true);
++        if (!p) {
++            error_setg(errp, "aka-lcdcam: cannot map '%s'", s->fb_path);
++            return;
++        }
++        s->fb = p;
++        memset(s->fb, 0, AKA_FB_FILE_SIZE);
++    } else {
++        s->local_fb = g_malloc0(AKA_FB_MAX_DIM * AKA_FB_MAX_DIM * 2);
++    }
++    aka_panel_reset(s);
++}
++
++static Property aka_lcdcam_props[] = {
++    DEFINE_PROP_STRING("fb-path", AkaLcdCamState, fb_path),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void aka_lcdcam_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = aka_lcdcam_realize;
++    device_class_set_legacy_reset(dc, aka_lcdcam_reset);
++    device_class_set_props(dc, aka_lcdcam_props);
++}
++
++static const TypeInfo aka_lcdcam_info = {
++    .name = TYPE_AKA_LCDCAM,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(AkaLcdCamState),
++    .instance_init = aka_lcdcam_init,
++    .class_init = aka_lcdcam_class_init,
++};
++
++static void aka_lcdcam_register_types(void)
++{
++    type_register_static(&aka_lcdcam_info);
++}
++
++type_init(aka_lcdcam_register_types)
+diff --git a/hw/misc/aka_sens.c b/hw/misc/aka_sens.c
+new file mode 100644
+index 0000000..64ade73
+--- /dev/null
++++ b/hw/misc/aka_sens.c
+@@ -0,0 +1,196 @@
++/*
++ * Gamebuino AKA - ESP32-S3 SENS block (SAR ADC1 only)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qapi/error.h"
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++#include "hw/qdev-properties.h"
++#include "hw/misc/aka_sens.h"
++#include "hw/misc/aka_shm.h"
++
++#define AKA_INPUT_MAGIC  0x49414B41u
++/* Board V4+: joystick X on ADC1 ch5, Y on ch4, battery (divided by 2) on ch3 */
++#define PAD_BATT 3
++#define PAD_JOYY 4
++#define PAD_JOYX 5
++/* Calibrated mV (IDF curve fitting, 12 dB, blank eFuse codes) for raw = 128 * i */
++static const uint16_t aka_cal_mv[] = {
++    0, 126, 249, 371, 491, 609, 726, 844, 960, 1076, 1192, 1309, 1427, 1544, 1662, 1778,
++    1895, 2012, 2128, 2240, 2352, 2461, 2568, 2669, 2765, 2857, 2942, 3018, 3086, 3144, 3190, 3225
++};
++
++/* Pad voltage (mV) -> raw 12-bit, inverse of the calibration table */
++static uint32_t aka_mv_to_raw(int32_t mv)
++{
++    const int n = ARRAY_SIZE(aka_cal_mv);
++
++    if (mv <= 0) {
++        return 0;
++    }
++    for (int i = 1; i < n; i++) {
++        if (mv <= aka_cal_mv[i]) {
++            const uint32_t d = aka_cal_mv[i] - aka_cal_mv[i - 1];
++            return 128 * (i - 1) + (d ? (128 * (mv - aka_cal_mv[i - 1])) / d : 0);
++        }
++    }
++    return 128 * (n - 1);      /* saturate just below 4095 (calibration blows up there) */
++}
++
++static void aka_sens_map_input(AkaSensState *s)
++{
++    if (s->in || !s->input_path) {
++        return;
++    }
++    void *p = aka_shm_map(s->input_path, 32, false);
++    if (p) {
++        s->in = p;
++    }
++}
++
++/*
++ * SENS_SAR_MEAS1_CTRL2_REG / SENS_SAR_MEAS2_CTRL2_REG, see soc/sens_reg.h.
++ * Both registers share the same layout.
++ */
++#define SENS_MEAS1_CTRL2        0xC
++#define SENS_MEAS2_CTRL2        0x30
++#define MEAS1_EN_PAD_S          19
++#define MEAS1_EN_PAD_M          (0xFFFu << MEAS1_EN_PAD_S)
++#define MEAS1_START_SAR         (1u << 17)
++#define MEAS1_DONE_SAR          (1u << 16)
++#define MEAS1_DATA_M            0xFFFFu
++
++static uint32_t aka_sens_meas(AkaSensState *s, hwaddr off,
++                              const uint32_t *pad_value)
++{
++    uint32_t reg = s->regs[off / 4];
++    uint32_t pads = (reg & MEAS1_EN_PAD_M) >> MEAS1_EN_PAD_S;
++    uint32_t data = 0;
++
++    if (pads) {
++        const unsigned pad = ctz32(pads) % AKA_SENS_ADC1_PADS;
++        data = pad_value[pad] & 0xFFF;
++        aka_sens_map_input(s);
++        if (s->in && (uint32_t) s->in[0] == AKA_INPUT_MAGIC && pad_value == s->pad_value) {
++            /* in[2]=joyx_mv in[3]=joyy_mv in[4]=battery_mv */
++            if (pad == PAD_JOYX) {
++                data = aka_mv_to_raw(s->in[2]);
++            } else if (pad == PAD_JOYY) {
++                data = aka_mv_to_raw(s->in[3]);
++            } else if (pad == PAD_BATT) {
++                data = aka_mv_to_raw(s->in[4] / 2);
++            }
++        }
++    }
++    reg = (reg & ~(MEAS1_DATA_M | MEAS1_DONE_SAR)) | data;
++    if (reg & MEAS1_START_SAR) {
++        reg |= MEAS1_DONE_SAR;
++    }
++    return reg;
++}
++
++static uint64_t aka_sens_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    AkaSensState *s = AKA_SENS(opaque);
++
++    if (addr >= AKA_SENS_SIZE) {
++        return 0;
++    }
++    if (addr == SENS_MEAS1_CTRL2) {
++        return aka_sens_meas(s, addr, s->pad_value);
++    }
++    if (addr == SENS_MEAS2_CTRL2) {
++        return aka_sens_meas(s, addr, s->pad2_value);
++    }
++    return s->regs[addr / 4];
++}
++
++static void aka_sens_write(void *opaque, hwaddr addr, uint64_t value,
++                           unsigned int size)
++{
++    AkaSensState *s = AKA_SENS(opaque);
++
++    if (addr >= AKA_SENS_SIZE) {
++        return;
++    }
++    s->regs[addr / 4] = (uint32_t)value;
++}
++
++static const MemoryRegionOps aka_sens_ops = {
++    .read = aka_sens_read,
++    .write = aka_sens_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void aka_sens_init(Object *obj)
++{
++    AkaSensState *s = AKA_SENS(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &aka_sens_ops, s,
++                          TYPE_AKA_SENS, AKA_SENS_SIZE);
++    sysbus_init_mmio(sbd, &s->iomem);
++}
++
++static void aka_sens_reset(DeviceState *dev)
++{
++    AkaSensState *s = AKA_SENS(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++}
++
++static Property aka_sens_props[] = {
++    DEFINE_PROP_STRING("input-path", AkaSensState, input_path),
++    DEFINE_PROP_UINT32("adc1-pad0", AkaSensState, pad_value[0], 2048),
++    DEFINE_PROP_UINT32("adc1-pad1", AkaSensState, pad_value[1], 2048),
++    DEFINE_PROP_UINT32("adc1-pad2", AkaSensState, pad_value[2], 2048),
++    DEFINE_PROP_UINT32("adc1-pad3", AkaSensState, pad_value[3], 2048),
++    DEFINE_PROP_UINT32("adc1-pad4", AkaSensState, pad_value[4], 2048),
++    DEFINE_PROP_UINT32("adc1-pad5", AkaSensState, pad_value[5], 2048),
++    DEFINE_PROP_UINT32("adc1-pad6", AkaSensState, pad_value[6], 2048),
++    DEFINE_PROP_UINT32("adc1-pad7", AkaSensState, pad_value[7], 2048),
++    DEFINE_PROP_UINT32("adc1-pad8", AkaSensState, pad_value[8], 2048),
++    DEFINE_PROP_UINT32("adc1-pad9", AkaSensState, pad_value[9], 2048),
++    DEFINE_PROP_UINT32("adc2-pad0", AkaSensState, pad2_value[0], 2048),
++    DEFINE_PROP_UINT32("adc2-pad1", AkaSensState, pad2_value[1], 2048),
++    DEFINE_PROP_UINT32("adc2-pad2", AkaSensState, pad2_value[2], 2048),
++    DEFINE_PROP_UINT32("adc2-pad3", AkaSensState, pad2_value[3], 2048),
++    DEFINE_PROP_UINT32("adc2-pad4", AkaSensState, pad2_value[4], 2048),
++    DEFINE_PROP_UINT32("adc2-pad5", AkaSensState, pad2_value[5], 2048),
++    DEFINE_PROP_UINT32("adc2-pad6", AkaSensState, pad2_value[6], 2048),
++    DEFINE_PROP_UINT32("adc2-pad7", AkaSensState, pad2_value[7], 2048),
++    DEFINE_PROP_UINT32("adc2-pad8", AkaSensState, pad2_value[8], 2048),
++    DEFINE_PROP_UINT32("adc2-pad9", AkaSensState, pad2_value[9], 2048),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void aka_sens_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, aka_sens_reset);
++    device_class_set_props(dc, aka_sens_props);
++}
++
++static const TypeInfo aka_sens_info = {
++    .name = TYPE_AKA_SENS,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(AkaSensState),
++    .instance_init = aka_sens_init,
++    .class_init = aka_sens_class_init,
++};
++
++static void aka_sens_register_types(void)
++{
++    type_register_static(&aka_sens_info);
++}
++
++type_init(aka_sens_register_types)
+diff --git a/hw/misc/esp32s3_cache.c b/hw/misc/esp32s3_cache.c
+index ef75966..ee1f62b 100644
+--- a/hw/misc/esp32s3_cache.c
++++ b/hw/misc/esp32s3_cache.c
+@@ -49,6 +49,56 @@ static inline uint32_t check_and_reset_ena(uint32_t* hwreg, uint32_t ena_mask, u
+ }
+ 
+ 
++
++/* Re-read every flash-mapped page so the cache model stays coherent with flash writes
++ * (real hardware: cache invalidate after SPI1 program/erase). */
++extern uint8_t *aka_cache_flash_ram;
++extern uint64_t aka_cache_flash_size;
++extern uint64_t aka_flash_gen;
++extern uint32_t aka_flash_dlo, aka_flash_dhi;
++bool aka_m25p80_read(uint32_t addr, uint8_t *buf, size_t len);
++
++static void aka_cache_read_flash(ESP32S3CacheState *s, uint32_t pa, uint8_t *d)
++{
++    if (!aka_m25p80_read(pa, d, ESP32S3_PAGE_SIZE)) {
++        blk_pread(s->flash_blk, pa, ESP32S3_PAGE_SIZE, d, 0);
++    }
++}
++
++static void esp32s3_cache_refresh_flash(ESP32S3CacheState *s)
++{
++    if (s->flash_blk == NULL) {
++        return;
++    }
++    static uint64_t last_gen = ~0ULL;
++    if (last_gen == aka_flash_gen) {
++        return;
++    }
++    last_gen = aka_flash_gen;
++    const uint32_t dlo = aka_flash_dlo, dhi = aka_flash_dhi;
++    aka_flash_dlo = 0xffffffffu;
++    aka_flash_dhi = 0;
++    ESP32S3XtsAesClass *xts_aes_class = ESP32S3_XTS_AES_GET_CLASS(s->xts_aes);
++    for (int i = 0; i < ESP32S3_MMU_TABLE_ENTRY_COUNT; i++) {
++        const ESP32S3MMUEntry e = s->mmu[i];
++        if (e.invalid || e.type != ESP32S3_MMU_TYPE_FLASH) {
++            continue;
++        }
++        const uint32_t pa = e.page_number * ESP32S3_PAGE_SIZE;
++        if (pa >= dhi || pa + ESP32S3_PAGE_SIZE <= dlo) {
++            continue;
++        }
++        if ((uint64_t) pa + ESP32S3_PAGE_SIZE > memory_region_size(&s->flash_mr)) {
++            continue;
++        }
++        uint8_t *d = ((uint8_t *) memory_region_get_ram_ptr(&s->flash_mr)) + pa;
++        aka_cache_read_flash(s, pa, d);
++        if (xts_aes_class->is_flash_enc_enabled(s->xts_aes)) {
++            xts_aes_class->decrypt(s->xts_aes, pa, d, ESP32S3_PAGE_SIZE);
++        }
++    }
++}
++
+ static inline uint32_t esp32s3_read_mmu_value(ESP32S3CacheState *s, hwaddr reg_addr)
+ {
+     /* Make the assumption that the address is aligned on sizeof(uint32_t) */
+@@ -71,7 +121,7 @@ static void esp32s3_mmu_invalidate_page(ESP32S3CacheState *s, hwaddr virt_addr,
+     memory_region_notify_iommu(&s->iommu, 0, event);
+ 
+     /* If the page was mapped to flash, clear the content */
+-    if (!is_psram && clear_mr) {
++    if (false && !is_psram && clear_mr) {
+         const uint32_t invalid_value = 0xdeadbeef;
+         uint32_t* cache_word_data = (void*) ((uintptr_t) memory_region_get_ram_ptr(&s->flash_mr) + phys_addr);
+ 
+@@ -106,7 +156,7 @@ static inline void esp32s3_write_mmu_value(ESP32S3CacheState *s, hwaddr reg_addr
+         if (!e.invalid) {
+             if (e.type == ESP32S3_MMU_TYPE_FLASH && s->flash_blk != NULL) {
+                 uint8_t* cache_data = ((uint8_t*) memory_region_get_ram_ptr(&s->flash_mr)) + physical_address;
+-                blk_pread(s->flash_blk, physical_address, ESP32S3_PAGE_SIZE, cache_data, 0);
++                aka_cache_read_flash(s, physical_address, cache_data);
+ 
+                 if (xts_aes_class->is_flash_enc_enabled(s->xts_aes)) {
+                     xts_aes_class->decrypt(s->xts_aes, physical_address, cache_data, ESP32S3_PAGE_SIZE);
+@@ -249,6 +299,13 @@ static void esp32s3_cache_write(void *opaque, hwaddr addr, uint64_t value,
+                     s->regs[index] &= ~R_EXTMEM_DCACHE_FREEZE_DCACHE_FREEZE_DONE_MASK;
+                 }
+                 break;
++            case A_EXTMEM_DCACHE_SYNC_CTRL:
++            case A_EXTMEM_ICACHE_SYNC_CTRL:
++                s->regs[index] = value;
++                if (value & 1) {
++                    esp32s3_cache_refresh_flash(s);
++                }
++                break;
+             default:
+                 s->regs[index] = value;
+                 break;
+@@ -310,6 +367,8 @@ static void esp32s3_cache_realize(DeviceState *dev, Error **errp)
+ 
+         /* Initialize the address space that will contain the flash MemoryRegion */
+         address_space_init(&s->flash_as, &s->flash_mr, "esp32s3.cache.flash_as");
++        aka_cache_flash_ram = memory_region_get_ram_ptr(&s->flash_mr);
++        aka_cache_flash_size = memory_region_size(&s->flash_mr);
+     }
+ 
+     if (s->psram != NULL) {
+@@ -404,7 +463,9 @@ static IOMMUTLBEntry esp32s3_mmu_region_translate(IOMMUMemoryRegion *iommu, hwad
+         /* If there is no PSRAM connected to the machine, give no permission to the address space */
+         ret.perm = (s->psram == NULL) ? IOMMU_NONE : IOMMU_RW;
+     } else {
+-        ret.perm = (s->flash_blk == NULL) ? IOMMU_NONE : IOMMU_RO;
++        ret.perm = (s->flash_blk == NULL ||
++                    (uint64_t) ret.translated_addr + ESP32S3_PAGE_SIZE > memory_region_size(&s->flash_mr))
++                   ? IOMMU_NONE : IOMMU_RO;
+     }
+ 
+ #if CACHE_DEBUG
+diff --git a/hw/misc/esp_sha.c b/hw/misc/esp_sha.c
+index c9fa2e6..6f8c031 100644
+--- a/hw/misc/esp_sha.c
++++ b/hw/misc/esp_sha.c
+@@ -138,6 +138,7 @@ static void esp_sha_continue_dma(ESPShaState *s)
+         return;
+     }
+ 
++
+     /* Perform the actual SHA operation on the whole buffer */
+     for (uint32_t i = 0; i < blocks; i++)
+     {
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 0ac4b77..515607b 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -180,6 +180,10 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files(
+   'esp32c3_jtag.c',
+   'esp32s3_rtc_cntl.c',
+   'esp32s3_rng.c',
++  'aka_sens.c',
++  'aka_lcdcam.c',
++  'aka_i2s.c',
++  'aka_i2c_dev.c',
+   'esp32s3_pms.c',
+   'esp_hmac.c',
+   'esp32s3_hmac.c'
+diff --git a/hw/nvram/esp_efuse.c b/hw/nvram/esp_efuse.c
+index 7ee3fd6..f84100b 100644
+--- a/hw/nvram/esp_efuse.c
++++ b/hw/nvram/esp_efuse.c
+@@ -592,6 +592,11 @@ static void esp_efuse_realize(DeviceState *dev, Error **errp)
+             goto error;
+         }
+         memset(s->mirror, 0, size);
++        if (s->adc_calib) {
++            /* BLK_VERSION_MAJOR: BLOCK2 bit 128 (word 4, bits 1:0) = 1 */
++            uint32_t *w = (uint32_t *) ((uint8_t *) s->mirror + esp_offset_of_block(2));
++            w[4] |= 1;
++        }
+     } else {
+         /* A block was given as a parameter, open it in READ/WRITE */
+         if (!blk_supports_write_perm(s->blk)) {
+@@ -632,6 +637,7 @@ static void esp_efuse_init(Object *obj)
+ 
+ static Property esp_efuse_properties[] = {
+     DEFINE_PROP_DRIVE("drive", ESPEfuseState, blk),
++    DEFINE_PROP_BOOL("aka-adc-calib", ESPEfuseState, adc_calib, false),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index f9bd03f..393fa8d 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -2759,7 +2759,7 @@ static void sd_realize(DeviceState *dev, Error **errp)
+         }
+ 
+         blk_size = blk_getlength(sd->blk);
+-        if (blk_size > 0 && !is_power_of_2(blk_size)) {
++        if (false && blk_size > 0 && !is_power_of_2(blk_size)) {
+             int64_t blk_size_aligned = pow2ceil(blk_size);
+             char *blk_size_str;
+ 
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index 4a24a04..75ac501 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -49,6 +49,11 @@
+ #include "hw/misc/esp32s3_cache.h"
+ #include "hw/char/esp32s3_uart.h"
+ #include "hw/misc/esp32s3_rng.h"
++#include "hw/misc/aka_sens.h"
++#include "hw/misc/aka_lcdcam.h"
++#include "hw/misc/aka_i2s.h"
++#include "hw/misc/aka_i2c_dev.h"
++#include "hw/i2c/esp32_i2c.h"
+ 
+ #include "hw/nvram/esp32s3_efuse.h"
+ #include "hw/xtensa/esp32s3_clk.h"
+@@ -124,6 +129,10 @@ typedef struct Esp32s3SocState {
+     ESP32S3UARTState uart[ESP32S3_UART_COUNT];
+     ESP32S3GPIOState gpio;
+     Esp32s3RngState rng;
++    AkaSensState sens;
++    AkaLcdCamState lcdcam;
++    AkaI2sState i2s[2];
++    Esp32I2CState i2c0;
+     Esp32S3TWAIState twai;
+ 
+     Esp32s3RtcCntlState rtc_cntl;
+@@ -641,6 +650,11 @@ static void esp32s3_machine_init(MachineState *machine)
+     object_initialize_child(OBJECT(ss), "jtag", &ss->jtag, TYPE_ESP32C3_JTAG);
+     object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ESP32S3_GPIO);
+     object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
++    object_initialize_child(OBJECT(ss), "aka-sens", &ss->sens, TYPE_AKA_SENS);
++    object_initialize_child(OBJECT(ss), "aka-lcdcam", &ss->lcdcam, TYPE_AKA_LCDCAM);
++    object_initialize_child(OBJECT(ss), "aka-i2s0", &ss->i2s[0], TYPE_AKA_I2S);
++    object_initialize_child(OBJECT(ss), "aka-i2s1", &ss->i2s[1], TYPE_AKA_I2S);
++    object_initialize_child(OBJECT(ss), "aka-i2c0", &ss->i2c0, TYPE_ESP32_I2C);
+ 
+     object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
+ 
+@@ -708,6 +722,7 @@ static void esp32s3_machine_init(MachineState *machine)
+ 
+     /* eFuses realization */
+     {
++        object_property_set_bool(OBJECT(&ss->efuse), "aka-adc-calib", true, &error_fatal);
+         sysbus_realize(SYS_BUS_DEVICE(&ss->efuse), &error_fatal);
+         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->efuse), 0);
+         memory_region_add_subregion_overlap(sys_mem, DR_REG_EFUSE_BASE, mr, 0);
+@@ -778,6 +793,8 @@ static void esp32s3_machine_init(MachineState *machine)
+     {
+         qdev_realize(DEVICE(&ss->rng), &ss->periph_bus, &error_fatal);
+         esp32s3_soc_add_periph_device(sys_mem, &ss->rng, ESP32S3_RNG_BASE);
++        qdev_realize(DEVICE(&ss->sens), &ss->periph_bus, &error_fatal);
++        esp32s3_soc_add_periph_device(sys_mem, &ss->sens, AKA_SENS_BASE);
+ 
+     }
+ 
+@@ -807,6 +824,41 @@ static void esp32s3_machine_init(MachineState *machine)
+                            qdev_get_gpio_in(intmatrix_dev, ETS_SHA_INTR_SOURCE));
+     }
+ 
++    /* LCD_CAM (i8080 LCD + ST7789V panel) realization */
++    {
++        /* I2C0 master + the AKA I2C slaves */
++        qdev_prop_set_bit(DEVICE(&ss->i2c0), "s3-opcodes", true);
++        qdev_realize(DEVICE(&ss->i2c0), &ss->periph_bus, &error_fatal);
++        esp32s3_soc_add_periph_device(sys_mem, &ss->i2c0, DR_REG_I2C_EXT_BASE);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->i2c0), 0,
++                           qdev_get_gpio_in(intmatrix_dev, ETS_I2C_EXT0_INTR_SOURCE));
++        {
++            I2CBus *bus = I2C_BUS(qdev_get_child_bus(DEVICE(&ss->i2c0), "i2c"));
++            I2CSlave *e0 = i2c_slave_new(TYPE_AKA_EXPANDER, 0x38);
++            qdev_prop_set_uint32(DEVICE(e0), "half", 0);
++            i2c_slave_realize_and_unref(e0, bus, &error_fatal);
++            I2CSlave *e1 = i2c_slave_new(TYPE_AKA_EXPANDER, 0x3F);
++            qdev_prop_set_uint32(DEVICE(e1), "half", 1);
++            i2c_slave_realize_and_unref(e1, bus, &error_fatal);
++            i2c_slave_create_simple(bus, TYPE_AKA_TAS2505, 0x18);
++        }
++        ss->lcdcam.gdma = ESP_GDMA(&ss->gdma);
++        sysbus_realize(SYS_BUS_DEVICE(&ss->lcdcam), &error_fatal);
++        MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->lcdcam), 0);
++        memory_region_add_subregion_overlap(sys_mem, AKA_LCDCAM_BASE, mr, 0);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->lcdcam), 0,
++                           qdev_get_gpio_in(intmatrix_dev, ETS_LCD_CAM_INTR_SOURCE));
++
++        /* I2S0 / I2S1 transmit streaming (audio) */
++        for (int i = 0; i < 2; i++) {
++            object_property_set_link(OBJECT(&ss->i2s[i]), "gdma", OBJECT(&ss->gdma), &error_abort);
++            qdev_prop_set_uint32(DEVICE(&ss->i2s[i]), "periph", i ? GDMA_I2S1 : GDMA_I2S0);
++            sysbus_realize(SYS_BUS_DEVICE(&ss->i2s[i]), &error_fatal);
++            memory_region_add_subregion_overlap(sys_mem, i ? AKA_I2S1_BASE : AKA_I2S0_BASE,
++                sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->i2s[i]), 0), 0);
++        }
++    }
++
+     /* AES realization */
+     {
+         ss->aes.parent.gdma = ESP_GDMA(&ss->gdma);
+diff --git a/hw/xtensa/esp32s3_intc.c b/hw/xtensa/esp32s3_intc.c
+index 0437230..03a5e73 100644
+--- a/hw/xtensa/esp32s3_intc.c
++++ b/hw/xtensa/esp32s3_intc.c
+@@ -29,6 +29,7 @@
+ static void esp32s3_intmatrix_irq_handler(void *opaque, int n, int level)
+ {
+     Esp32s3IntMatrixState *s = ESP32S3_INTMATRIX(opaque);
++    s->src_level[n] = level ? 1 : 0;
+     for (int i = 0; i < ESP32S3_CPU_COUNT; ++i) {
+         if (s->outputs[i] == NULL) {
+             continue;
+@@ -72,7 +73,24 @@ static void esp32s3_intmatrix_write(void* opaque, hwaddr addr, uint64_t value, u
+     Esp32s3IntMatrixState *s = ESP32S3_INTMATRIX(opaque);
+     uint8_t* map_entry = get_map_entry(s, addr);
+     if (map_entry != NULL) {
+-        *map_entry = value & 0x1f;
++        int source = (addr / sizeof(uint32_t)) % ESP32S3_INT_MATRIX_INPUTS;
++        int cpu = (addr / sizeof(uint32_t)) / ESP32S3_INT_MATRIX_INPUTS;
++        uint8_t old = *map_entry;
++        uint8_t new = value & 0x1f;
++        *map_entry = new;
++        /* Re-route a level that is already asserted when the mapping changes
++         * (esp_intr_enable/disable work by remapping the source). */
++        if (old != new && cpu < ESP32S3_CPU_COUNT && s->outputs[cpu] != NULL
++            && s->src_level[source]) {
++            for (int k = 0; k < s->cpu[cpu]->env.config->nextint; ++k) {
++                int ext = s->cpu[cpu]->env.config->extint[k];
++                if (ext == old) {
++                    qemu_set_irq(s->outputs[cpu][k], 0);
++                } else if (ext == new) {
++                    qemu_set_irq(s->outputs[cpu][k], 1);
++                }
++            }
++        }
+     }
+ }
+ 
+diff --git a/include/hw/dma/esp_gdma.h b/include/hw/dma/esp_gdma.h
+index d555249..52c23e5 100644
+--- a/include/hw/dma/esp_gdma.h
++++ b/include/hw/dma/esp_gdma.h
+@@ -109,6 +109,10 @@ typedef struct {
+     uint32_t peripheral;
+     /* Interrupt related registers */
+     DmaIntState int_state;
++    /* AKA: cursor used by esp_gdma_out_stream() (continuous peripherals such as I2S) */
++    uint32_t stream_desc;       /* guest address of the descriptor being consumed */
++    uint32_t stream_off;        /* bytes already consumed in that descriptor */
++    bool stream_active;
+ } DmaConfigState;
+ 
+ 
+@@ -156,6 +160,21 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
+                                      uint32_t* chan);
+ 
+ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size);
++
++/* AKA: find the OUT channel configured for `periph` (no START requirement). */
++bool esp_gdma_find_out_channel(ESPGdmaState *s, GdmaPeripheral periph, uint32_t *chan);
++/* AKA: true (once) when the guest has started the OUT link of `chan` since the last call. */
++bool esp_gdma_out_take_start(ESPGdmaState *s, uint32_t chan);
++/* AKA: continuous OUT stream. Reads up to `size` bytes following the descriptor chain from where
++ * the previous call stopped, raising OUT_EOF at the end of each descriptor that has suc_eof.
++ * Returns the number of bytes produced (0 when the channel is not running). */
++uint32_t esp_gdma_out_stream(ESPGdmaState *s, uint32_t chan, uint8_t *buffer, uint32_t size);
++
++/**
++ * @brief Number of valid bytes in the OUT descriptor list of `chan`, from its
++ *        current link address up to the descriptor flagged EOF.
++ */
++uint32_t esp_gdma_out_chain_length(ESPGdmaState *s, uint32_t chan);
+ bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size);
+ 
+ 
+diff --git a/include/hw/i2c/esp32_i2c.h b/include/hw/i2c/esp32_i2c.h
+index b17dc75..6dc2b93 100644
+--- a/include/hw/i2c/esp32_i2c.h
++++ b/include/hw/i2c/esp32_i2c.h
+@@ -24,6 +24,7 @@ typedef struct Esp32I2CState {
+     Fifo8 rx_fifo;
+     Fifo8 tx_fifo;
+     bool trans_ongoing;
++    bool s3_opcodes;      /* ESP32-S3 command encoding (RSTART=6, READ=3, STOP=2) */
+ 
+     uint32_t ctr_reg;
+     uint32_t timeout_reg;
+diff --git a/include/hw/misc/aka_i2c_dev.h b/include/hw/misc/aka_i2c_dev.h
+new file mode 100644
+index 0000000..74acb3b
+--- /dev/null
++++ b/include/hw/misc/aka_i2c_dev.h
+@@ -0,0 +1,28 @@
++/*
++ * Gamebuino AKA - I2C slave devices: PCF8574-like button expanders (0x38 and
++ * 0x3F) and the TAS2505 audio codec/amplifier (0x18, register stub).
++ *
++ * The button/joystick state is read from a small file shared with the PC
++ * front-end ("input-path", see AkaInputShared).
++ */
++#pragma once
++
++#include "hw/i2c/i2c.h"
++
++#define TYPE_AKA_EXPANDER "aka.expander"
++#define TYPE_AKA_TAS2505  "aka.tas2505"
++
++/* Layout of the shared input file (little endian) */
++typedef struct AkaInputShared {
++    uint32_t magic;       /* 'AKAI' 0x49414B41 */
++    uint32_t keys;        /* EXPANDER_KEY_* bits, 1 = pressed */
++    int32_t  joyx_mv;     /* 0..3300 */
++    int32_t  joyy_mv;
++    int32_t  battery_mv;
++    uint32_t pad[3];
++} AkaInputShared;
++
++#define AKA_INPUT_MAGIC 0x49414B41u
++
++/* Maps the shared input file; returns NULL when it is missing. Never fails hard. */
++const volatile AkaInputShared *aka_input_map(const char *path);
+diff --git a/include/hw/misc/aka_i2s.h b/include/hw/misc/aka_i2s.h
+new file mode 100644
+index 0000000..266ef88
+--- /dev/null
++++ b/include/hw/misc/aka_i2s.h
+@@ -0,0 +1,49 @@
++/*
++ * Gamebuino AKA - ESP32-S3 I2S TX (std mode) streaming to a shared audio ring.
++ *
++ * Only the transmit path used by the console is modelled: the driver programs a
++ * circular GDMA OUT chain; this device consumes it in real time and publishes the
++ * 16-bit samples in a shared file read by the front-end.
++ */
++#pragma once
++
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++#include "hw/dma/esp_gdma.h"
++
++#define TYPE_AKA_I2S "misc.aka.i2s"
++#define AKA_I2S(obj) OBJECT_CHECK(AkaI2sState, (obj), TYPE_AKA_I2S)
++
++#define AKA_I2S0_BASE  0x6000F000
++#define AKA_I2S1_BASE  0x6002D000
++#define AKA_I2S_SIZE   0x1000
++
++#define AKA_AUDIO_MAGIC       0x41414B41u   /* 'AKAA' */
++#define AKA_AUDIO_RING_FRAMES 16384
++
++typedef struct AkaAudioShared {
++    uint32_t magic;
++    uint32_t rate;
++    uint32_t channels;
++    uint32_t ring_frames;
++    volatile uint32_t write_pos;    /* in frames, free running */
++    uint32_t pad[11];
++    int16_t ring[AKA_AUDIO_RING_FRAMES];
++} AkaAudioShared;
++
++typedef struct AkaI2sState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    uint32_t regs[AKA_I2S_SIZE / 4];
++    ESPGdmaState *gdma;
++    uint32_t periph;                /* GDMA_I2S0 / GDMA_I2S1 */
++    char *audio_path;
++    uint32_t default_rate;
++    AkaAudioShared *out;
++    QEMUTimer timer;
++    int64_t last_ns;
++    double frac;
++    bool running;
++    uint32_t chan;
++    bool have_chan;
++} AkaI2sState;
+diff --git a/include/hw/misc/aka_lcdcam.h b/include/hw/misc/aka_lcdcam.h
+new file mode 100644
+index 0000000..a33f69b
+--- /dev/null
++++ b/include/hw/misc/aka_lcdcam.h
+@@ -0,0 +1,77 @@
++/*
++ * Gamebuino AKA - ESP32-S3 LCD_CAM (i8080 LCD mode) + ST7789V panel
++ *
++ * The controller reproduces the register interface used by ESP-IDF's
++ * esp_lcd i80 driver: command phase, DMA data phase (through the GDMA),
++ * byte/bit swizzling and the "transaction done" interrupt. The panel is
++ * modelled behind it and drawn into a framebuffer that is shared with the
++ * PC front-end through a memory-mapped file (property "fb-path").
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#pragma once
++
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++#include "qemu/timer.h"
++#include "hw/dma/esp_gdma.h"
++
++#define TYPE_AKA_LCDCAM "misc.aka.lcdcam"
++#define AKA_LCDCAM(obj) OBJECT_CHECK(AkaLcdCamState, (obj), TYPE_AKA_LCDCAM)
++
++#define AKA_LCDCAM_BASE     0x60041000
++#define AKA_LCDCAM_SIZE     0x100
++
++/*
++ * Shared framebuffer file layout (little endian):
++ *   0x00 u32 magic 'AKAF'     0x04 u32 version (1)
++ *   0x08 u32 width            0x0c u32 height   (current orientation)
++ *   0x10 u32 frame counter    0x14 u32 flags    (AKA_FB_FLAG_*)
++ *   0x40 pixels, RGB565, row stride = width, at most 320x320
++ */
++#define AKA_FB_MAGIC        0x46414B41u
++#define AKA_FB_VERSION      1
++#define AKA_FB_HEADER_SIZE  0x40
++#define AKA_FB_MAX_DIM      320
++#define AKA_FB_FILE_SIZE    (AKA_FB_HEADER_SIZE + AKA_FB_MAX_DIM * AKA_FB_MAX_DIM * 2)
++
++#define AKA_FB_FLAG_DISPLAY_ON  (1u << 0)
++#define AKA_FB_FLAG_INVERSION   (1u << 1)   /* INVON was sent */
++#define AKA_FB_FLAG_BGR         (1u << 2)   /* MADCTL RGB/BGR bit */
++#define AKA_FB_FLAG_SLEEP_OUT   (1u << 3)
++
++typedef struct AkaLcdCamState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    qemu_irq irq;
++    ESPGdmaState *gdma;          /* set by the machine, like SHA/AES */
++    QEMUTimer *done_timer;
++
++    uint32_t regs[AKA_LCDCAM_SIZE / 4];
++    uint32_t int_raw;
++    uint32_t int_ena;
++    bool busy;
++
++    /* Panel (ST7789V) */
++    uint8_t  cur_cmd;
++    uint8_t  param_buf[4];
++    uint32_t param_cnt;
++    uint16_t pix_hi;
++    bool     pix_have_hi;
++    uint16_t col_start, col_end;
++    uint16_t row_start, row_end;
++    uint16_t cur_x, cur_y;
++    uint8_t  madctl;
++    uint8_t  colmod;
++    uint32_t flags;
++    uint32_t frame_count;
++
++    /* Shared framebuffer */
++    char *fb_path;
++    uint8_t *fb;                 /* mmap of the shared file, or NULL */
++    uint16_t *local_fb;          /* used when no file is configured */
++    uint32_t width, height;
++} AkaLcdCamState;
+diff --git a/include/hw/misc/aka_sens.h b/include/hw/misc/aka_sens.h
+new file mode 100644
+index 0000000..010aaed
+--- /dev/null
++++ b/include/hw/misc/aka_sens.h
+@@ -0,0 +1,35 @@
++/*
++ * Gamebuino AKA - ESP32-S3 SENS block (SAR ADC1 and ADC2)
++ *
++ * Minimal model: a conversion on ADC1 completes immediately and returns the
++ * raw 12-bit value configured for the selected pad (joystick X/Y, battery).
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#pragma once
++
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++
++#define TYPE_AKA_SENS "misc.aka.sens"
++#define AKA_SENS(obj) OBJECT_CHECK(AkaSensState, (obj), TYPE_AKA_SENS)
++
++#define AKA_SENS_BASE       0x60008800
++#define AKA_SENS_SIZE       0x400
++#define AKA_SENS_ADC1_PADS  12
++
++typedef struct AkaSensState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    uint32_t regs[AKA_SENS_SIZE / 4];
++    /* Raw 12-bit value returned for each ADC1 pad (property adc1-padN) */
++    uint32_t pad_value[AKA_SENS_ADC1_PADS];
++    /* Same for ADC2 (properties adc2-padN) */
++    uint32_t pad2_value[AKA_SENS_ADC1_PADS];
++    /* Shared input file (joystick / battery), see aka_i2c_dev.c */
++    char *input_path;
++    volatile int32_t *in;           /* mmap of the shared input file (8 words) */
++} AkaSensState;
+diff --git a/include/hw/misc/aka_shm.h b/include/hw/misc/aka_shm.h
+new file mode 100644
+index 0000000..db9529f
+--- /dev/null
++++ b/include/hw/misc/aka_shm.h
+@@ -0,0 +1,60 @@
++/*
++ * Gamebuino AKA - portable shared file mapping (POSIX mmap / Win32).
++ * aka_shm_map() opens (creating if needed) a file of `size` bytes and maps it
++ * read/write shared. Returns NULL on failure. *created is set when the file
++ * was newly created or zero-sized (optional).
++ */
++#ifndef AKA_SHM_H
++#define AKA_SHM_H
++
++#include <stddef.h>
++#include <stdbool.h>
++
++#ifdef _WIN32
++#include <windows.h>
++
++static inline void *aka_shm_map(const char *path, size_t size, bool rw)
++{
++    DWORD acc = rw ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
++    HANDLE f = CreateFileA(path, acc,
++                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                           NULL, rw ? OPEN_ALWAYS : OPEN_EXISTING,
++                           FILE_ATTRIBUTE_NORMAL, NULL);
++    if (f == INVALID_HANDLE_VALUE) {
++        return NULL;
++    }
++    HANDLE m = CreateFileMappingA(f, NULL, rw ? PAGE_READWRITE : PAGE_READONLY,
++                                  0, (DWORD)size, NULL);
++    CloseHandle(f);
++    if (!m) {
++        return NULL;
++    }
++    void *p = MapViewOfFile(m, rw ? FILE_MAP_ALL_ACCESS : FILE_MAP_READ,
++                            0, 0, size);
++    CloseHandle(m);          /* the view keeps the mapping alive */
++    return p;
++}
++
++#else
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++static inline void *aka_shm_map(const char *path, size_t size, bool rw)
++{
++    int fd = open(path, rw ? (O_RDWR | O_CREAT) : O_RDONLY, 0666);
++    if (fd < 0) {
++        return NULL;
++    }
++    if (rw && ftruncate(fd, size) != 0) {
++        close(fd);
++        return NULL;
++    }
++    void *p = mmap(NULL, size, rw ? (PROT_READ | PROT_WRITE) : PROT_READ,
++                   MAP_SHARED, fd, 0);
++    close(fd);
++    return p == MAP_FAILED ? NULL : p;
++}
++#endif
++
++#endif
+diff --git a/include/hw/nvram/esp_efuse.h b/include/hw/nvram/esp_efuse.h
+index 6ed0157..faaac48 100644
+--- a/include/hw/nvram/esp_efuse.h
++++ b/include/hw/nvram/esp_efuse.h
+@@ -202,6 +202,8 @@ typedef struct ESPEfuseState {
+     /* In case no block was given by the user, use the mirror as a file in RAM */
+     BlockBackend *blk;
+     void* mirror;
++    /* AKA: pretend BLK2 holds ADC calibration V1 (BLK_VERSION_MAJOR=1) */
++    bool adc_calib;
+ 
+     qemu_irq irq;
+     /* Use a mirror to make sure the operation value did not change between the moment
+diff --git a/include/hw/xtensa/esp32s3_intc.h b/include/hw/xtensa/esp32s3_intc.h
+index 5960b9d..a008372 100644
+--- a/include/hw/xtensa/esp32s3_intc.h
++++ b/include/hw/xtensa/esp32s3_intc.h
+@@ -142,6 +142,7 @@ typedef struct Esp32s3IntMatrixState {
+     MemoryRegion iomem;
+     qemu_irq *outputs[ESP32S3_CPU_COUNT];
+     uint8_t irq_map[ESP32S3_CPU_COUNT][ESP32S3_INT_MATRIX_INPUTS];
++    uint8_t src_level[ESP32S3_INT_MATRIX_INPUTS];
+ 
+     /* properties */
+     XtensaCPU *cpu[ESP32S3_CPU_COUNT];
