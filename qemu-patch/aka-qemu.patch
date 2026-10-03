@@ -2135,3 +2135,22 @@ index 5960b9d..a008372 100644
  
      /* properties */
      XtensaCPU *cpu[ESP32S3_CPU_COUNT];
+diff --git a/meson.build b/meson.build
+index 7f28871..b366ced 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1227,9 +1227,11 @@ if not get_option('slirp').auto() or have_system
+     slirp_cflags += ['-DLIBSLIRP_STATIC'] 
+   endif
+ 
+-  slirp = declare_dependency(dependencies: [slirp_dep],
+-                          compile_args: slirp_cflags,
+-                          version: slirp_dep.version())
++  if slirp_dep.found()
++    slirp = declare_dependency(dependencies: [slirp_dep],
++                            compile_args: slirp_cflags,
++                            version: slirp_dep.version())
++  endif
+ 
+   # slirp < 4.7 is incompatible with CFI support in QEMU.  This is because
+   # it passes function pointers within libslirp as callbacks for timers.
