@@ -18,5 +18,5 @@ jobs:
       - name: Le patch s'applique sur la base Espressif
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/espressif/qemu.git qemu
-          cd qemu && git checkout "$(cat ../qemu-patch/BASE_COMMIT)"
-          git apply --check ../qemu-patch/aka-qemu.patch
+          cd qemu && git checkout "$(tr -d '\r\n' < ../qemu-patch/BASE_COMMIT)"
+          tr -d '\r' < ../qemu-patch/aka-qemu.patch | git apply --check

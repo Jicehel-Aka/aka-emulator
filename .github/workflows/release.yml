@@ -15,11 +15,11 @@ jobs:
       - name: Dependances
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev libfdt-dev libsdl2-dev
+          sudo apt-get install -y g++ ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev libfdt-dev libsdl2-dev libgcrypt20-dev zlib1g-dev
       - name: Fork QEMU Espressif + patch AKA
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/espressif/qemu.git qemu
-          cd qemu && git checkout "$(cat ../qemu-patch/BASE_COMMIT)" && git apply ../qemu-patch/aka-qemu.patch
+          cd qemu && git checkout "$(tr -d '\r\n' < ../qemu-patch/BASE_COMMIT)" && tr -d '\r' < ../qemu-patch/aka-qemu.patch | git apply --whitespace=nowarn
       - name: Cache ccache
         uses: actions/cache@v4
         with:
@@ -64,13 +64,14 @@ jobs:
             git base-devel ninja python
             mingw-w64-x86_64-toolchain mingw-w64-x86_64-glib2 mingw-w64-x86_64-pixman
             mingw-w64-x86_64-SDL2 mingw-w64-x86_64-python-setuptools
-            mingw-w64-x86_64-meson mingw-w64-x86_64-dtc
+            mingw-w64-x86_64-meson mingw-w64-x86_64-dtc mingw-w64-x86_64-libgcrypt
       - name: Fork QEMU Espressif + patch AKA
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/espressif/qemu.git qemu
-          cd qemu && git checkout "$(cat ../qemu-patch/BASE_COMMIT)" && git apply ../qemu-patch/aka-qemu.patch
+          cd qemu && git checkout "$(tr -d '\r\n' < ../qemu-patch/BASE_COMMIT)" && tr -d '\r' < ../qemu-patch/aka-qemu.patch | git apply --whitespace=nowarn
       - name: Compile QEMU + front-end
         run: |
+          sed -i 's/\r$//' windows/*.sh
           bash windows/build-qemu-msys2.sh
           bash windows/build-front-msys2.sh
       - name: Package

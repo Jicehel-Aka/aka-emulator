@@ -1,2 +1,5 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Le patch doit rester en LF (sinon git apply echoue) ; les scripts shell aussi
+*.patch -text
+qemu-patch/BASE_COMMIT text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
