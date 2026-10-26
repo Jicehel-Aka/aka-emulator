@@ -12,9 +12,9 @@ Exemple :
         --flash aka-flash.bin --sd ./macarte
 
 - La flash est créée au premier lancement, puis **conservée** (les jeux installés restent). `--fresh` ou **F6** la refait.
-- `--sd DOSSIER` : un dossier sert de carte SD (un sous-dossier par application : firmware.bin, meta.json, screen.bpm).
+- `--sd DOSSIER` : un dossier sert de carte SD (un sous-dossier par application : firmware.bin, meta.json, screen.bmp).
   `--sd-img carte.img` : image FAT32 existante.
-- `--launcher-slot 0|1` (défaut 1 = app1) ; `--game firmware.bin` pré-installe un jeu dans l'autre slot ; `--boot-game` démarre dessus.
+- `--game firmware.bin` pré-installe un jeu. Organisation **loader/game** (`app/test` + `app/factory`) : launcher dans `test`, jeu dans `factory`, pas d'otadata (le démarrage à froid lance toujours le Launcher). Organisation **OTA** : `--launcher-slot 0|1` (défaut 1 = app1), le jeu va dans l'autre slot, `--boot-game` démarre dessus.
 - Toutes les options peuvent être mises dans `aka-emu.cfg` (une ligne `cle=valeur`, ex. `sd=./macarte`).
 - Touches : flèches/ZQSD… (voir boutons à l'écran), IJKL = joystick, **F5** relancer, **F4** quitter.
 - Si QEMU s'arrête ou est introuvable, le message apparaît dans le titre de la fenêtre.

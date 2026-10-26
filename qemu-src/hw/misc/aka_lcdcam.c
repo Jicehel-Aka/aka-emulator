@@ -64,16 +64,6 @@
 #define MADCTL_MY   0x80
 #define MADCTL_BGR  0x08
 
-static bool aka_lcd_debug(void)
-{
-    static int dbg = -1;
-
-    if (dbg < 0) {
-        dbg = getenv("AKA_LCD_DEBUG") ? 1 : 0;
-    }
-    return dbg;
-}
-
 /* ------------------------------------------------------------------ */
 /* Shared framebuffer                                                  */
 /* ------------------------------------------------------------------ */
@@ -262,9 +252,6 @@ static void aka_lcdcam_done(void *opaque)
 {
     AkaLcdCamState *s = opaque;
 
-    if (aka_lcd_debug()) {
-        fprintf(stderr, "[lcdcam] done (ena=0x%x)\n", s->int_ena);
-    }
     s->busy = false;
     s->regs[REG_LCD_USER / 4] &= ~USER_START;
     s->int_raw |= INT_TRANS_DONE;
@@ -280,10 +267,6 @@ static void aka_lcdcam_start(AkaLcdCamState *s)
     const bool dc_data = dc_idle ^ !!(misc & MISC_CD_DATA_SET);
     uint32_t nbytes = 0;
 
-    if (aka_lcd_debug()) {
-        fprintf(stderr, "[lcdcam] start user=0x%08x misc=0x%08x cmdval=0x%08x\n",
-                user, misc, s->regs[REG_LCD_CMD_VAL / 4]);
-    }
 
     if (user & USER_CMD) {
         const uint32_t v = s->regs[REG_LCD_CMD_VAL / 4];
@@ -307,10 +290,6 @@ static void aka_lcdcam_start(AkaLcdCamState *s)
         if (esp_gdma_get_channel_periph(s->gdma, GDMA_LCDCAM,
                                         ESP_GDMA_OUT_IDX, &chan)) {
             uint32_t len = esp_gdma_out_chain_length(s->gdma, chan);
-            if (aka_lcd_debug()) {
-                fprintf(stderr, "[lcdcam]   data phase chan=%u len=%u cur_cmd=0x%02x\n",
-                        chan, len, s->cur_cmd);
-            }
             uint8_t *buf = g_malloc(len ? len : 1);
 
             if (len && esp_gdma_read_channel(s->gdma, chan, buf, len)) {
@@ -363,9 +342,6 @@ static uint64_t aka_lcdcam_read(void *opaque, hwaddr addr, unsigned int size)
 {
     AkaLcdCamState *s = opaque;
 
-    if (aka_lcd_debug() && (addr == REG_INT_ST || addr == REG_INT_RAW)) {
-        fprintf(stderr, "[lcdcam] R 0x%02x raw=%x ena=%x\n", (unsigned)addr, s->int_raw, s->int_ena);
-    }
     switch (addr) {
     case REG_INT_ENA:
         return s->int_ena;
@@ -386,9 +362,6 @@ static void aka_lcdcam_write(void *opaque, hwaddr addr, uint64_t value,
     AkaLcdCamState *s = opaque;
     const uint32_t v = (uint32_t)value;
 
-    if (aka_lcd_debug()) {
-        fprintf(stderr, "[lcdcam] W 0x%02x = 0x%08x (busy=%d)\n", (unsigned)addr, v, s->busy);
-    }
 
     switch (addr) {
     case REG_INT_ENA:

@@ -18,7 +18,8 @@ struct Options {
     std::string bootloader;      // bootloader.bin
     std::string launcher;        // optionnel
     std::string game;            // optionnel
-    int  launcherSlot = 1;       // 0 = app0 (ota_0), 1 = app1 (ota_1) : comme l'AKA
+    int  launcherSlot = 1;       // 0 = app0 (ota_0), 1 = app1 (ota_1) : ancienne organisation OTA
+                                 // (ignore si la table contient app/test + app/factory)
     bool bootGame = false;       // demarrer sur le jeu plutot que le launcher
     int  flashMB = 8;
 };

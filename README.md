@@ -2,7 +2,10 @@
 
 Fait tourner le **vrai firmware ESP32-S3** (.bin) dans QEMU, avec un front-end SDL2 :
 écran 320×240, boutons/joystick, son, carte SD simulée par un dossier, flash construite
-depuis `partitions.bin` (Launcher dans app1, jeux installés dans app0, comme sur la console).
+depuis `partitions.bin`. Deux organisations de la flash sont reconnues :
+- **loader/game** (par défaut, `sample/real/`) : Launcher en `app/test`, jeu en `app/factory`, bootloader
+  modifié qui choisit selon la cause du reset (mise sous tension ou watchdog RTC → Launcher, sinon jeu) ;
+- **OTA** (`sample/real-ota/`) : Launcher en app1, jeux en app0, comme l'ancienne version de la console. Le Launcher fourni gère les deux dispositions.
 
 ## Démarrage rapide (Linux)
     sudo apt install libsdl2-2.0-0 libglib2.0-0 libpixman-1-0 libfdt1
@@ -23,12 +26,16 @@ Touches PC : flèches, IJKL = joystick (voir boutons à l'écran) ; **F4** quitt
 
 ## Utiliser tes propres fichiers
 Remplace `sample/real/*` par ta table de partitions, ton bootloader et ton Launcher (les offsets viennent
-de `partitions.bin`, rien n'est codé en dur). Une SD = un dossier par appli (`firmware.bin`, `meta.json`, `screen.bpm`).
-Si le Launcher est flashé en app0, il se recopie lui-même en app1 au premier démarrage.
+de `partitions.bin`, rien n'est codé en dur). Une SD = un dossier par appli (`firmware.bin`, `meta.json`, `screen.bmp`).
+Dans l'organisation OTA, si le Launcher est flashé en app0, il se recopie lui-même en app1 au premier démarrage ;
+dans loader/game, flashé en `factory` il se recopie en `loader`, puis demande d'éteindre.
+**Mise à jour du Launcher depuis la SD** : copie le nouveau Launcher dans un dossier de la SD (`firmware.bin`) et lance-le
+depuis le Launcher ; il s'installe lui-même (loader/game : éteindre puis rallumer = redémarrer l'émulateur, F5).
+**Changer d'organisation** (autre `partitions.bin`) demande de refaire la flash : option `--fresh` ou touche **F6**.
 
 ## Périphériques émulés
 Écran ST7789 via LCD_CAM+GDMA, TE 60 Hz, boutons (expander I2C), joystick+batterie (ADC calibré),
-SD (SPI), flash SPI + cache avec OTA (esp_ota_*), SHA, audio I2S → SDL (44,1 kHz mono).
+SD (SPI), flash SPI + cache avec OTA (esp_ota_*), SHA, watchdog RTC (reset cause 0x10, utilisé pour revenir au Launcher), audio I2S → SDL (44,1 kHz mono).
 
 ## Recompiler QEMU
 Prendre le fork Espressif QEMU (commit dans `qemu-patch/README.md`), `git apply qemu-patch/aka-qemu.patch`, puis :

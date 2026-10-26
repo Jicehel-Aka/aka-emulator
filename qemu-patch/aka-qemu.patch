@@ -108,10 +108,18 @@ index 46dbe7c..f10a821 100644
          if (!blk_check_size_and_read_all(s->blk, DEVICE(s),
                                           s->storage, s->size, errp)) {
 diff --git a/hw/dma/esp_gdma.c b/hw/dma/esp_gdma.c
-index 6640fca..da92cca 100644
+index 6640fca..cf76218 100644
 --- a/hw/dma/esp_gdma.c
 +++ b/hw/dma/esp_gdma.c
-@@ -178,7 +178,10 @@ static bool esp_gdma_write_descr(ESPGdmaState *s, uint32_t addr, GdmaLinkedList*
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/log.h"
+ #include "qemu/error-report.h"
+ #include "sysemu/dma.h"
+ #include "hw/sysbus.h"
+@@ -178,7 +179,10 @@ static bool esp_gdma_write_descr(ESPGdmaState *s, uint32_t addr, GdmaLinkedList*
   */
  static bool esp_gdma_read_guest(ESPGdmaState *s, uint32_t addr, void* data, uint32_t len)
  {
@@ -123,7 +131,7 @@ index 6640fca..da92cca 100644
      return res == MEMTX_OK;
  }
  
-@@ -277,7 +280,7 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
+@@ -277,7 +281,7 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
      for (int i = 0; i < class->m_channel_count; i++) {
          /* IN/OUT PERI registers have the same organization, can use any macro.
           * Look for the channel that was configured with the given peripheral. It must be marked as "started" too */
@@ -132,31 +140,31 @@ index 6640fca..da92cca 100644
               FIELD_EX32(s->ch_conf[dir][i].link, GDMA_OUT_LINK, START)) {
  
              *chan = i;
-@@ -326,6 +329,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+@@ -326,6 +330,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
       * On the real hardware, both in and out are checked at the same time, so in case of an error, both bits
       * are set. Replicate the same behavior here. */
      if ( !valid || (owner_check_out && !out_list.config.owner) ) {
-+        fprintf(stderr, "[gdma] first desc bad valid=%d owner=%d addr=0x%x\n", valid, out_list.config.owner, out_addr);
++        qemu_log_mask(LOG_GUEST_ERROR, "[gdma] first desc bad valid=%d owner=%d addr=0x%x\n", valid, out_list.config.owner, out_addr);
          esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
          return false;
      }
-@@ -342,6 +346,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+@@ -342,6 +347,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
  
          valid = esp_gdma_read_guest(s, out_list.buf_addr, buffer + consumed, min);
          if (!valid) {
-+            fprintf(stderr, "[gdma] read_guest fail addr=0x%x len=%u consumed=%u\n", out_list.buf_addr, min, consumed);
++            qemu_log_mask(LOG_GUEST_ERROR, "[gdma] read_guest fail addr=0x%x len=%u consumed=%u\n", out_list.buf_addr, min, consumed);
              esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
              error = true;
              break;
-@@ -372,6 +377,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+@@ -372,6 +378,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
  
              /* Only check the valid flag and the owner if we don't have to exit the loop*/
              if ( !exit_loop && (!valid || (owner_check_out && !out_list.config.owner)) ) {
-+                fprintf(stderr, "[gdma] next node bad valid=%d owner=%d next=0x%x consumed=%u\n", valid, out_list.config.owner, out_addr, consumed);
++                qemu_log_mask(LOG_GUEST_ERROR, "[gdma] next node bad valid=%d owner=%d next=0x%x consumed=%u\n", valid, out_list.config.owner, out_addr, consumed);
                  esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
                  error = true;
              }
-@@ -401,6 +407,77 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
+@@ -401,6 +408,77 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
  }
  
  
@@ -234,7 +242,7 @@ index 6640fca..da92cca 100644
  /**
   * @brief Write data to the guest RAM pointed by the linked list configured in the given DmaConfigState index.
   *        `size` bytes from `buffer` will be written to guest machine's RAM.
-@@ -1021,3 +1098,26 @@ static void esp_gdma_register_types(void)
+@@ -1021,3 +1099,26 @@ static void esp_gdma_register_types(void)
  }
  
  type_init(esp_gdma_register_types)
@@ -548,10 +556,10 @@ index 0000000..18db0a1
 +type_init(aka_i2c_dev_register_types)
 diff --git a/hw/misc/aka_i2s.c b/hw/misc/aka_i2s.c
 new file mode 100644
-index 0000000..018583f
+index 0000000..6229979
 --- /dev/null
 +++ b/hw/misc/aka_i2s.c
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,197 @@
 +/*
 + * Gamebuino AKA - ESP32-S3 I2S TX streaming (see aka_i2s.h)
 + *
@@ -667,9 +675,6 @@ index 0000000..018583f
 +        return;
 +    }
 +    s->regs[addr / 4] = (uint32_t) value;
-+    if (getenv("AKA_I2S_LOG")) {
-+        fprintf(stderr, "[i2s%u] W 0x%03lx = 0x%08lx\n", s->periph, (unsigned long) addr, (unsigned long) value);
-+    }
 +    if (addr == 0x20) {
 +        s->regs[addr / 4] &= ~(1u << 8);     /* RX_UPDATE self clearing */
 +    }
@@ -754,10 +759,10 @@ index 0000000..018583f
 +type_init(aka_i2s_register_types)
 diff --git a/hw/misc/aka_lcdcam.c b/hw/misc/aka_lcdcam.c
 new file mode 100644
-index 0000000..9a312c8
+index 0000000..efafc4a
 --- /dev/null
 +++ b/hw/misc/aka_lcdcam.c
-@@ -0,0 +1,509 @@
+@@ -0,0 +1,482 @@
 +/*
 + * Gamebuino AKA - ESP32-S3 LCD_CAM (i8080 LCD mode) + ST7789V panel
 + *
@@ -823,16 +828,6 @@ index 0000000..9a312c8
 +#define MADCTL_MX   0x40
 +#define MADCTL_MY   0x80
 +#define MADCTL_BGR  0x08
-+
-+static bool aka_lcd_debug(void)
-+{
-+    static int dbg = -1;
-+
-+    if (dbg < 0) {
-+        dbg = getenv("AKA_LCD_DEBUG") ? 1 : 0;
-+    }
-+    return dbg;
-+}
 +
 +/* ------------------------------------------------------------------ */
 +/* Shared framebuffer                                                  */
@@ -1022,9 +1017,6 @@ index 0000000..9a312c8
 +{
 +    AkaLcdCamState *s = opaque;
 +
-+    if (aka_lcd_debug()) {
-+        fprintf(stderr, "[lcdcam] done (ena=0x%x)\n", s->int_ena);
-+    }
 +    s->busy = false;
 +    s->regs[REG_LCD_USER / 4] &= ~USER_START;
 +    s->int_raw |= INT_TRANS_DONE;
@@ -1040,10 +1032,6 @@ index 0000000..9a312c8
 +    const bool dc_data = dc_idle ^ !!(misc & MISC_CD_DATA_SET);
 +    uint32_t nbytes = 0;
 +
-+    if (aka_lcd_debug()) {
-+        fprintf(stderr, "[lcdcam] start user=0x%08x misc=0x%08x cmdval=0x%08x\n",
-+                user, misc, s->regs[REG_LCD_CMD_VAL / 4]);
-+    }
 +
 +    if (user & USER_CMD) {
 +        const uint32_t v = s->regs[REG_LCD_CMD_VAL / 4];
@@ -1067,10 +1055,6 @@ index 0000000..9a312c8
 +        if (esp_gdma_get_channel_periph(s->gdma, GDMA_LCDCAM,
 +                                        ESP_GDMA_OUT_IDX, &chan)) {
 +            uint32_t len = esp_gdma_out_chain_length(s->gdma, chan);
-+            if (aka_lcd_debug()) {
-+                fprintf(stderr, "[lcdcam]   data phase chan=%u len=%u cur_cmd=0x%02x\n",
-+                        chan, len, s->cur_cmd);
-+            }
 +            uint8_t *buf = g_malloc(len ? len : 1);
 +
 +            if (len && esp_gdma_read_channel(s->gdma, chan, buf, len)) {
@@ -1123,9 +1107,6 @@ index 0000000..9a312c8
 +{
 +    AkaLcdCamState *s = opaque;
 +
-+    if (aka_lcd_debug() && (addr == REG_INT_ST || addr == REG_INT_RAW)) {
-+        fprintf(stderr, "[lcdcam] R 0x%02x raw=%x ena=%x\n", (unsigned)addr, s->int_raw, s->int_ena);
-+    }
 +    switch (addr) {
 +    case REG_INT_ENA:
 +        return s->int_ena;
@@ -1146,9 +1127,6 @@ index 0000000..9a312c8
 +    AkaLcdCamState *s = opaque;
 +    const uint32_t v = (uint32_t)value;
 +
-+    if (aka_lcd_debug()) {
-+        fprintf(stderr, "[lcdcam] W 0x%02x = 0x%08x (busy=%d)\n", (unsigned)addr, v, s->busy);
-+    }
 +
 +    switch (addr) {
 +    case REG_INT_ENA:
@@ -1470,7 +1448,7 @@ index 0000000..64ade73
 +
 +type_init(aka_sens_register_types)
 diff --git a/hw/misc/esp32s3_cache.c b/hw/misc/esp32s3_cache.c
-index ef75966..ee1f62b 100644
+index ef75966..abe3ef5 100644
 --- a/hw/misc/esp32s3_cache.c
 +++ b/hw/misc/esp32s3_cache.c
 @@ -49,6 +49,56 @@ static inline uint32_t check_and_reset_ena(uint32_t* hwreg, uint32_t ena_mask, u
@@ -1562,7 +1540,45 @@ index ef75966..ee1f62b 100644
              default:
                  s->regs[index] = value;
                  break;
-@@ -310,6 +367,8 @@ static void esp32s3_cache_realize(DeviceState *dev, Error **errp)
+@@ -269,10 +326,37 @@ static const MemoryRegionOps esp32s3_cache_ops = {
+     .endianness = DEVICE_LITTLE_ENDIAN,
+ };
+ 
++/* Apres un reset, relit toute la flash : l'application a pu la modifier (installation d'un jeu
++ * ou du Launcher) alors que des pages etaient en cache ; sur le vrai chip le cache est vide
++ * apres un reset. Sans cela, le bootloader pouvait lire d'anciennes donnees. */
++static void esp32s3_cache_reload_all_flash(ESP32S3CacheState *s)
++{
++    if (s->flash_blk == NULL || aka_cache_flash_ram == NULL || s->xts_aes == NULL) {
++        return;
++    }
++    ESP32S3XtsAesClass *xts_aes_class = ESP32S3_XTS_AES_GET_CLASS(s->xts_aes);
++    const uint64_t size = memory_region_size(&s->flash_mr);
++    for (uint64_t pa = 0; pa + ESP32S3_PAGE_SIZE <= size; pa += ESP32S3_PAGE_SIZE) {
++        uint8_t *d = aka_cache_flash_ram + pa;
++        aka_cache_read_flash(s, (uint32_t) pa, d);
++        if (xts_aes_class->is_flash_enc_enabled(s->xts_aes)) {
++            xts_aes_class->decrypt(s->xts_aes, (uint32_t) pa, d, ESP32S3_PAGE_SIZE);
++        }
++    }
++}
++
++/* Appele aussi sur un reset CPU seul (esp_restart) : le cache n'est pas reinitialise dans ce
++ * cas, mais la flash peut avoir change. */
++void esp32s3_cache_flush_flash_copy(ESP32S3CacheState *s)
++{
++    esp32s3_cache_reload_all_flash(s);
++}
++
+ static void esp32s3_cache_reset_hold(Object *obj, ResetType type)
+ {
+     ESP32S3CacheState *s = ESP32S3_CACHE(obj);
+     memset(s->regs, 0, ESP32S3_CACHE_REG_COUNT * sizeof(*s->regs));
++    esp32s3_cache_reload_all_flash(s);
+ 
+     /* Initialize the MMU with invalid entries */
+     for (int i = 0; i < ESP32S3_MMU_TABLE_ENTRY_COUNT; i++) {
+@@ -310,6 +394,8 @@ static void esp32s3_cache_realize(DeviceState *dev, Error **errp)
  
          /* Initialize the address space that will contain the flash MemoryRegion */
          address_space_init(&s->flash_as, &s->flash_mr, "esp32s3.cache.flash_as");
@@ -1571,7 +1587,7 @@ index ef75966..ee1f62b 100644
      }
  
      if (s->psram != NULL) {
-@@ -404,7 +463,9 @@ static IOMMUTLBEntry esp32s3_mmu_region_translate(IOMMUMemoryRegion *iommu, hwad
+@@ -404,7 +490,9 @@ static IOMMUTLBEntry esp32s3_mmu_region_translate(IOMMUMemoryRegion *iommu, hwad
          /* If there is no PSRAM connected to the machine, give no permission to the address space */
          ret.perm = (s->psram == NULL) ? IOMMU_NONE : IOMMU_RW;
      } else {
@@ -1582,6 +1598,125 @@ index ef75966..ee1f62b 100644
      }
  
  #if CACHE_DEBUG
+diff --git a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
+index 76076c7..1449a50 100644
+--- a/hw/misc/esp32s3_rtc_cntl.c
++++ b/hw/misc/esp32s3_rtc_cntl.c
+@@ -23,6 +23,7 @@
+ 
+ static void esp32s3_rtc_update_cpu_stall(Esp32s3RtcCntlState* s);
+ static void esp32s3_rtc_update_clk(Esp32s3RtcCntlState* s);
++static void esp32s3_rtc_wdt_rearm(Esp32s3RtcCntlState *s);
+ 
+ static uint64_t esp32s3_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+@@ -72,6 +73,17 @@ static uint64_t esp32s3_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int si
+     case A_RTC_CNTL_STORE7:
+         r = s->scratch_reg[(addr - A_RTC_CNTL_STORE4) / 4 + 4];
+         break;
++
++    case A_RTC_CNTL_WDTCONFIG0:
++    case A_RTC_CNTL_WDTCONFIG1:
++    case A_RTC_CNTL_WDTCONFIG2:
++    case A_RTC_CNTL_WDTCONFIG3:
++    case A_RTC_CNTL_WDTCONFIG4:
++        r = s->wdt_config[(addr - A_RTC_CNTL_WDTCONFIG0) / 4];
++        break;
++    case A_RTC_CNTL_WDTWPROTECT:
++        r = s->wdt_wprotect;
++        break;
+     }
+     return r;
+ }
+@@ -142,9 +154,70 @@ static void esp32s3_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
+     case A_RTC_CNTL_STORE7:
+         s->scratch_reg[(addr - A_RTC_CNTL_STORE4) / 4 + 4] = value;
+         break;
++
++    case A_RTC_CNTL_WDTCONFIG0:
++    case A_RTC_CNTL_WDTCONFIG1:
++    case A_RTC_CNTL_WDTCONFIG2:
++    case A_RTC_CNTL_WDTCONFIG3:
++    case A_RTC_CNTL_WDTCONFIG4:
++        s->wdt_config[(addr - A_RTC_CNTL_WDTCONFIG0) / 4] = value;
++        esp32s3_rtc_wdt_rearm(s);
++        break;
++    case A_RTC_CNTL_WDTFEED:
++        esp32s3_rtc_wdt_rearm(s);
++        break;
++    case A_RTC_CNTL_WDTWPROTECT:
++        s->wdt_wprotect = value;
++        break;
+     }
+ }
+ 
++/*
++ * Watchdog RTC : (re)arme le timer du stage 0 quand le WDT est active et que
++ * l'action est un reset. Actions : 2 = reset CPU, 3 = reset systeme,
++ * 4 = reset systeme + RTC (cause 0x10, RESET_REASON_SYS_RTC_WDT).
++ * L'action "interruption" (1) n'est pas emulee.
++ */
++static void esp32s3_rtc_wdt_expire(void *opaque)
++{
++    Esp32s3RtcCntlState *s = ESP32S3_RTC_CNTL(opaque);
++    uint32_t act = FIELD_EX32(s->wdt_config[0], RTC_CNTL_WDTCONFIG0, STG0);
++
++    s->wdt_config[0] = 0;          /* le reset remet le WDT a zero */
++    switch (act) {
++    case 2:
++        s->reset_cause[0] = ESP32_RTCWDT_CPU_RESET;
++        qemu_irq_pulse(s->cpu_reset_req[0]);
++        break;
++    case 3:
++        s->reset_cause[0] = ESP32_RTCWDT_SYS_RESET;
++        s->reset_cause[1] = ESP32_RTCWDT_SYS_RESET;
++        qemu_irq_pulse(s->dig_reset_req);
++        break;
++    case 4:
++        s->reset_cause[0] = ESP32_RTCWDT_RTC_RESET;
++        s->reset_cause[1] = ESP32_RTCWDT_RTC_RESET;
++        qemu_irq_pulse(s->dig_reset_req);
++        break;
++    default:
++        break;
++    }
++}
++
++static void esp32s3_rtc_wdt_rearm(Esp32s3RtcCntlState *s)
++{
++    uint32_t act = FIELD_EX32(s->wdt_config[0], RTC_CNTL_WDTCONFIG0, STG0);
++
++    if (!FIELD_EX32(s->wdt_config[0], RTC_CNTL_WDTCONFIG0, EN) ||
++        act < 2 || act > 4) {
++        timer_del(s->wdt_timer);
++        return;
++    }
++    uint64_t ticks = s->wdt_config[1];
++    uint64_t ns = muldiv64(ticks, NANOSECONDS_PER_SECOND, s->rtc_slowclk_freq);
++    timer_mod(s->wdt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
++}
++
+ static void esp32s3_rtc_update_cpu_stall(Esp32s3RtcCntlState* s)
+ {
+     uint32_t procpu_stall = (FIELD_EX32(s->sw_cpu_stall_reg, RTC_CNTL_SW_CPU_STALL, PROCPU_C1) << 2) |
+@@ -182,10 +255,17 @@ static void esp32s3_rtc_cntl_reset_hold(Object *obj, ResetType type)
+     Esp32s3RtcCntlState *s = ESP32S3_RTC_CNTL(obj);
+ 
+     s->time_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    memset(s->wdt_config, 0, sizeof(s->wdt_config));
++    s->wdt_wprotect = 0;
++    if (s->wdt_timer) {
++        timer_del(s->wdt_timer);
++    }
+ }
+ 
+ static void esp32s3_rtc_cntl_realize(DeviceState *dev, Error **errp)
+ {
++    Esp32s3RtcCntlState *s = ESP32S3_RTC_CNTL(dev);
++    s->wdt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_rtc_wdt_expire, s);
+ }
+ 
+ static void esp32s3_rtc_cntl_init(Object *obj)
 diff --git a/hw/misc/esp_sha.c b/hw/misc/esp_sha.c
 index c9fa2e6..6f8c031 100644
 --- a/hw/misc/esp_sha.c
@@ -1647,11 +1782,16 @@ index f9bd03f..393fa8d 100644
              char *blk_size_str;
  
 diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
-index 4a24a04..75ac501 100644
+index 4a24a04..7172f1f 100644
 --- a/hw/xtensa/esp32s3.c
 +++ b/hw/xtensa/esp32s3.c
-@@ -49,6 +49,11 @@
+@@ -47,8 +47,16 @@
+ 
+ #include "hw/ssi/esp32s3_spi.h"
  #include "hw/misc/esp32s3_cache.h"
++#include "exec/tb-flush.h"
++
++extern uint64_t aka_flash_gen;   /* hw/block/m25p80.c : compteur de modifications de la flash */
  #include "hw/char/esp32s3_uart.h"
  #include "hw/misc/esp32s3_rng.h"
 +#include "hw/misc/aka_sens.h"
@@ -1662,7 +1802,7 @@ index 4a24a04..75ac501 100644
  
  #include "hw/nvram/esp32s3_efuse.h"
  #include "hw/xtensa/esp32s3_clk.h"
-@@ -124,6 +129,10 @@ typedef struct Esp32s3SocState {
+@@ -124,6 +132,10 @@ typedef struct Esp32s3SocState {
      ESP32S3UARTState uart[ESP32S3_UART_COUNT];
      ESP32S3GPIOState gpio;
      Esp32s3RngState rng;
@@ -1673,7 +1813,24 @@ index 4a24a04..75ac501 100644
      Esp32S3TWAIState twai;
  
      Esp32s3RtcCntlState rtc_cntl;
-@@ -641,6 +650,11 @@ static void esp32s3_machine_init(MachineState *machine)
+@@ -213,6 +225,16 @@ static void esp32s3_soc_reset(DeviceState *dev)
+         }
+     }
+     if (s->requested_reset & ESP32S3_SOC_RESET_PROCPU) {
++        esp32s3_cache_flush_flash_copy(&s->cache);   /* flash modifiee par l'appli : cache perime */
++        {
++            /* Le code execute depuis la flash a pu etre remplace (installation d'un jeu ou du
++             * Launcher) : les traductions TCG de l'ancien code ne sont plus valides. */
++            static uint64_t seen_gen;
++            if (seen_gen != aka_flash_gen) {
++                seen_gen = aka_flash_gen;
++                tb_flush(CPU(&s->cpu[0]));
++            }
++        }
+         xtensa_select_static_vectors(&s->cpu[0].env, s->rtc_cntl.stat_vector_sel[0]);
+         remove_cpu_watchpoints(&s->cpu[0]);
+         cpu_reset(CPU(&s->cpu[0]));
+@@ -641,6 +663,11 @@ static void esp32s3_machine_init(MachineState *machine)
      object_initialize_child(OBJECT(ss), "jtag", &ss->jtag, TYPE_ESP32C3_JTAG);
      object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ESP32S3_GPIO);
      object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
@@ -1685,7 +1842,7 @@ index 4a24a04..75ac501 100644
  
      object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
  
-@@ -708,6 +722,7 @@ static void esp32s3_machine_init(MachineState *machine)
+@@ -708,6 +735,7 @@ static void esp32s3_machine_init(MachineState *machine)
  
      /* eFuses realization */
      {
@@ -1693,7 +1850,7 @@ index 4a24a04..75ac501 100644
          sysbus_realize(SYS_BUS_DEVICE(&ss->efuse), &error_fatal);
          MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->efuse), 0);
          memory_region_add_subregion_overlap(sys_mem, DR_REG_EFUSE_BASE, mr, 0);
-@@ -778,6 +793,8 @@ static void esp32s3_machine_init(MachineState *machine)
+@@ -778,6 +806,8 @@ static void esp32s3_machine_init(MachineState *machine)
      {
          qdev_realize(DEVICE(&ss->rng), &ss->periph_bus, &error_fatal);
          esp32s3_soc_add_periph_device(sys_mem, &ss->rng, ESP32S3_RNG_BASE);
@@ -1702,7 +1859,7 @@ index 4a24a04..75ac501 100644
  
      }
  
-@@ -807,6 +824,41 @@ static void esp32s3_machine_init(MachineState *machine)
+@@ -807,6 +837,41 @@ static void esp32s3_machine_init(MachineState *machine)
                             qdev_get_gpio_in(intmatrix_dev, ETS_SHA_INTR_SOURCE));
      }
  
@@ -2110,6 +2267,52 @@ index 0000000..db9529f
 +#endif
 +
 +#endif
+diff --git a/include/hw/misc/esp32s3_cache.h b/include/hw/misc/esp32s3_cache.h
+index c0a4159..27b7465 100644
+--- a/include/hw/misc/esp32s3_cache.h
++++ b/include/hw/misc/esp32s3_cache.h
+@@ -119,6 +119,8 @@ typedef struct {
+     ESP32S3MMUEntry mmu[ESP32S3_MMU_TABLE_ENTRY_COUNT];
+ } ESP32S3CacheState;
+ 
++void esp32s3_cache_flush_flash_copy(ESP32S3CacheState *s);
++
+ /* Assert that the size of the MMU table in the structure is of size ESP32S3_MMU_SIZE */
+ _Static_assert(sizeof(((ESP32S3CacheState*)0)->mmu) == ESP32S3_MMU_SIZE,
+                "The size of `mmu` field in structure ESP32C3CacheState must be equal to ESP32S3_MMU_SIZE");
+diff --git a/include/hw/misc/esp32s3_rtc_cntl.h b/include/hw/misc/esp32s3_rtc_cntl.h
+index 45bd7e2..fb6c98a 100644
+--- a/include/hw/misc/esp32s3_rtc_cntl.h
++++ b/include/hw/misc/esp32s3_rtc_cntl.h
+@@ -84,6 +84,11 @@ typedef struct Esp32s3RtcCntlState {
+     uint32_t scratch_reg[ESP32S3_RTC_CNTL_SCRATCH_REG_COUNT];
+     Esp32s3ResetCause reset_cause[ESP32S3_CPU_COUNT];
+     bool stat_vector_sel[ESP32S3_CPU_COUNT];
++
++    /* RTC watchdog (RWDT) : stage 0 uniquement, actions de reset */
++    uint32_t wdt_config[5];
++    uint32_t wdt_wprotect;
++    QEMUTimer *wdt_timer;
+ } Esp32s3RtcCntlState;
+ 
+ REG32(RTC_CNTL_OPTIONS0, 0x00)
+@@ -115,6 +120,16 @@ REG32(RTC_CNTL_CLK_CONF, 0x74)
+     FIELD(RTC_CNTL_CLK_CONF, FAST_CLK_RTC_SEL, 29, 1)
+     FIELD(RTC_CNTL_CLK_CONF, SOC_CLK_SEL, 27, 2)
+ 
++REG32(RTC_CNTL_WDTCONFIG0, 0x98)
++    FIELD(RTC_CNTL_WDTCONFIG0, EN, 31, 1)
++    FIELD(RTC_CNTL_WDTCONFIG0, STG0, 28, 3)
++REG32(RTC_CNTL_WDTCONFIG1, 0x9c)
++REG32(RTC_CNTL_WDTCONFIG2, 0xa0)
++REG32(RTC_CNTL_WDTCONFIG3, 0xa4)
++REG32(RTC_CNTL_WDTCONFIG4, 0xa8)
++REG32(RTC_CNTL_WDTFEED, 0xac)
++REG32(RTC_CNTL_WDTWPROTECT, 0xb0)
++
+ REG32(RTC_CNTL_SW_CPU_STALL, 0xbc)
+     FIELD(RTC_CNTL_SW_CPU_STALL, PROCPU_C1, 26, 6)
+     FIELD(RTC_CNTL_SW_CPU_STALL, APPCPU_C1, 20, 6)
 diff --git a/include/hw/nvram/esp_efuse.h b/include/hw/nvram/esp_efuse.h
 index 6ed0157..faaac48 100644
 --- a/include/hw/nvram/esp_efuse.h

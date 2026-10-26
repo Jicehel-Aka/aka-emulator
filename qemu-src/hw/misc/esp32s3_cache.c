@@ -326,10 +326,37 @@ static const MemoryRegionOps esp32s3_cache_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/* Apres un reset, relit toute la flash : l'application a pu la modifier (installation d'un jeu
+ * ou du Launcher) alors que des pages etaient en cache ; sur le vrai chip le cache est vide
+ * apres un reset. Sans cela, le bootloader pouvait lire d'anciennes donnees. */
+static void esp32s3_cache_reload_all_flash(ESP32S3CacheState *s)
+{
+    if (s->flash_blk == NULL || aka_cache_flash_ram == NULL || s->xts_aes == NULL) {
+        return;
+    }
+    ESP32S3XtsAesClass *xts_aes_class = ESP32S3_XTS_AES_GET_CLASS(s->xts_aes);
+    const uint64_t size = memory_region_size(&s->flash_mr);
+    for (uint64_t pa = 0; pa + ESP32S3_PAGE_SIZE <= size; pa += ESP32S3_PAGE_SIZE) {
+        uint8_t *d = aka_cache_flash_ram + pa;
+        aka_cache_read_flash(s, (uint32_t) pa, d);
+        if (xts_aes_class->is_flash_enc_enabled(s->xts_aes)) {
+            xts_aes_class->decrypt(s->xts_aes, (uint32_t) pa, d, ESP32S3_PAGE_SIZE);
+        }
+    }
+}
+
+/* Appele aussi sur un reset CPU seul (esp_restart) : le cache n'est pas reinitialise dans ce
+ * cas, mais la flash peut avoir change. */
+void esp32s3_cache_flush_flash_copy(ESP32S3CacheState *s)
+{
+    esp32s3_cache_reload_all_flash(s);
+}
+
 static void esp32s3_cache_reset_hold(Object *obj, ResetType type)
 {
     ESP32S3CacheState *s = ESP32S3_CACHE(obj);
     memset(s->regs, 0, ESP32S3_CACHE_REG_COUNT * sizeof(*s->regs));
+    esp32s3_cache_reload_all_flash(s);
 
     /* Initialize the MMU with invalid entries */
     for (int i = 0; i < ESP32S3_MMU_TABLE_ENTRY_COUNT; i++) {

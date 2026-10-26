@@ -113,9 +113,6 @@ static void aka_i2s_write(void *opaque, hwaddr addr, uint64_t value, unsigned in
         return;
     }
     s->regs[addr / 4] = (uint32_t) value;
-    if (getenv("AKA_I2S_LOG")) {
-        fprintf(stderr, "[i2s%u] W 0x%03lx = 0x%08lx\n", s->periph, (unsigned long) addr, (unsigned long) value);
-    }
     if (addr == 0x20) {
         s->regs[addr / 4] &= ~(1u << 8);     /* RX_UPDATE self clearing */
     }

@@ -47,6 +47,9 @@
 
 #include "hw/ssi/esp32s3_spi.h"
 #include "hw/misc/esp32s3_cache.h"
+#include "exec/tb-flush.h"
+
+extern uint64_t aka_flash_gen;   /* hw/block/m25p80.c : compteur de modifications de la flash */
 #include "hw/char/esp32s3_uart.h"
 #include "hw/misc/esp32s3_rng.h"
 #include "hw/misc/aka_sens.h"
@@ -222,6 +225,16 @@ static void esp32s3_soc_reset(DeviceState *dev)
         }
     }
     if (s->requested_reset & ESP32S3_SOC_RESET_PROCPU) {
+        esp32s3_cache_flush_flash_copy(&s->cache);   /* flash modifiee par l'appli : cache perime */
+        {
+            /* Le code execute depuis la flash a pu etre remplace (installation d'un jeu ou du
+             * Launcher) : les traductions TCG de l'ancien code ne sont plus valides. */
+            static uint64_t seen_gen;
+            if (seen_gen != aka_flash_gen) {
+                seen_gen = aka_flash_gen;
+                tb_flush(CPU(&s->cpu[0]));
+            }
+        }
         xtensa_select_static_vectors(&s->cpu[0].env, s->rtc_cntl.stat_vector_sel[0]);
         remove_cpu_watchpoints(&s->cpu[0]);
         cpu_reset(CPU(&s->cpu[0]));

@@ -9,6 +9,7 @@ namespace {
 constexpr uint32_t kTableOffset = 0x8000;
 constexpr uint8_t kTypeApp = 0x00, kTypeData = 0x01;
 constexpr uint8_t kSubOta0 = 0x10, kSubOtaData = 0x00;   // data/ota = 0x00
+constexpr uint8_t kSubFactory = 0x00, kSubTest = 0x20;   // app/factory, app/test
 
 bool readFile(const std::string& p, std::vector<uint8_t>& v)
 {
@@ -147,9 +148,19 @@ bool build(const Options& o, std::vector<uint8_t>& out, std::string& err)
         for (const auto& p : table) if (p.type == kTypeApp && p.subtype == kSubOta0 + idx) return &p;
         return nullptr;
     };
+    auto findSub = [&](uint8_t sub) -> const Partition* {
+        for (const auto& p : table) if (p.type == kTypeApp && p.subtype == sub) return &p;
+        return nullptr;
+    };
+    // Nouvelle organisation (bootloader modifie) : launcher en app/test, jeu en
+    // app/factory, pas d'otadata ; le bootloader choisit selon la cause du reset.
+    const Partition* testPart = findSub(kSubTest);
+    const Partition* factPart = findSub(kSubFactory);
+    const bool resetReasonLayout = testPart && factPart;
+
     const Partition* slot[2] = {findApp(0), findApp(1)};
-    const Partition* ldr = slot[o.launcherSlot ? 1 : 0];
-    const Partition* gam = slot[o.launcherSlot ? 0 : 1];
+    const Partition* ldr = resetReasonLayout ? testPart : slot[o.launcherSlot ? 1 : 0];
+    const Partition* gam = resetReasonLayout ? factPart : slot[o.launcherSlot ? 0 : 1];
 
     auto place = [&](const std::string& file, const Partition* p, const char* what) -> bool {
         if (file.empty()) return true;
@@ -163,6 +174,8 @@ bool build(const Options& o, std::vector<uint8_t>& out, std::string& err)
     };
     if (!place(o.launcher, ldr, "le launcher")) return false;
     if (!place(o.game, gam, "le jeu")) return false;
+
+    if (resetReasonLayout) return true;   // pas d'otadata : demarrage a froid = launcher
 
     for (const auto& p : table) {
         if (p.type == kTypeData && p.subtype == kSubOtaData) {

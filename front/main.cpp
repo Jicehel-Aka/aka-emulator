@@ -152,11 +152,6 @@ static void audio_cb(void *, Uint8 *out, int len)
         o[i] = last;
     }
     if (wavf) fwrite(out, 1, len, wavf);
-    if (getenv("AKA_AUDIO_DEBUG")) {
-        static int c = 0; static int mx = 0;
-        for (int i = 0; i < n; i++) mx = std::max(mx, (int)std::abs((int)o[i]));
-        if (++c % 86 == 0) { fprintf(stderr, "[aud] wp=%u rp=%u avail=%u max=%d\n", wp, aud_rp, wp - aud_rp, mx); mx = 0; }
-    }
     // trop de retard accumule : on rattrape en sautant (evite la latence qui derive)
     if (avail > target * 3) aud_rp = wp - target;
 }

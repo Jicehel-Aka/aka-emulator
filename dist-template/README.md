@@ -23,7 +23,7 @@ Touches PC : flèches, IJKL = joystick (voir boutons à l'écran) ; **F4** quitt
 
 ## Utiliser tes propres fichiers
 Remplace `sample/real/*` par ta table de partitions, ton bootloader et ton Launcher (les offsets viennent
-de `partitions.bin`, rien n'est codé en dur). Une SD = un dossier par appli (`firmware.bin`, `meta.json`, `screen.bpm`).
+de `partitions.bin`, rien n'est codé en dur). Une SD = un dossier par appli (`firmware.bin`, `meta.json`, `screen.bmp`).
 Si le Launcher est flashé en app0, il se recopie lui-même en app1 au premier démarrage.
 
 ## Périphériques émulés

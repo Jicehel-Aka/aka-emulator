@@ -4,9 +4,14 @@ aka_flash.py - assemble une image de flash 8 Mo comme le ferait la console AKA.
 
 Principe : aucun offset n'est ecrit en dur. Tout vient de la table de
 partitions (CSV ou .bin), exactement comme le font l'AKA et ESP-IDF :
-  - loader : premiere partition app de sous-type OTA_1 (cf. aka_runtime.cpp)
-  - jeu    : premiere partition app de sous-type OTA_0, sinon FACTORY
-  - otadata: ecrite pour choisir la partition de demarrage (launcher ou jeu)
+Deux organisations sont reconnues :
+  - ancienne (OTA)  : loader = app/ota_1, jeu = app/ota_0, otadata ecrite pour
+                      choisir la partition de demarrage (--boot)
+  - nouvelle (test) : loader = app/test, jeu = app/factory, pas d'otadata ; le
+                      bootloader modifie choisit selon la cause du reset
+                      (mise sous tension ou watchdog RTC -> loader, sinon jeu).
+                      --boot est alors sans effet : un demarrage a froid lance
+                      toujours le loader.
 
 Usage :
   aka_flash.py --partitions parts.csv|parts.bin --bootloader bootloader.bin \
@@ -89,12 +94,13 @@ def main():
         "bootloader")
     put(img, PARTTABLE_OFFSET, table.to_binary(), "table de partitions")
 
-    loader = find_app(table, [gp.SUBTYPES[gp.APP_TYPE]["ota_1"]])
+    loader = find_app(table, [gp.SUBTYPES[gp.APP_TYPE]["test"],
+                              gp.SUBTYPES[gp.APP_TYPE]["ota_1"]])
     game = find_app(table, [gp.SUBTYPES[gp.APP_TYPE]["ota_0"],
                             gp.SUBTYPES[gp.APP_TYPE]["factory"]])
     if a.loader:
         if not loader:
-            sys.exit("pas de partition loader (app/ota_1) dans la table")
+            sys.exit("pas de partition loader (app/test ou app/ota_1) dans la table")
         data = open(a.loader, "rb").read()
         if len(data) > loader.size:
             sys.exit("le launcher ne tient pas dans %s" % loader.name)
@@ -126,7 +132,7 @@ def main():
         else:
             print("otadata  -> laissee vide (demarrage sur factory/ota_0)")
     else:
-        print("pas d'otadata : demarrage sur factory/ota_0")
+        print("pas d'otadata : le bootloader choisit selon la cause du reset")
 
     with open(a.output, "wb") as f:
         f.write(img)

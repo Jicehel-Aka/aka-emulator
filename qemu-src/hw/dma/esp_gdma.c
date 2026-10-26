@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "sysemu/dma.h"
 #include "hw/sysbus.h"
@@ -329,7 +330,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
      * On the real hardware, both in and out are checked at the same time, so in case of an error, both bits
      * are set. Replicate the same behavior here. */
     if ( !valid || (owner_check_out && !out_list.config.owner) ) {
-        fprintf(stderr, "[gdma] first desc bad valid=%d owner=%d addr=0x%x\n", valid, out_list.config.owner, out_addr);
+        qemu_log_mask(LOG_GUEST_ERROR, "[gdma] first desc bad valid=%d owner=%d addr=0x%x\n", valid, out_list.config.owner, out_addr);
         esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
         return false;
     }
@@ -346,7 +347,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
 
         valid = esp_gdma_read_guest(s, out_list.buf_addr, buffer + consumed, min);
         if (!valid) {
-            fprintf(stderr, "[gdma] read_guest fail addr=0x%x len=%u consumed=%u\n", out_list.buf_addr, min, consumed);
+            qemu_log_mask(LOG_GUEST_ERROR, "[gdma] read_guest fail addr=0x%x len=%u consumed=%u\n", out_list.buf_addr, min, consumed);
             esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
             error = true;
             break;
@@ -377,7 +378,7 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
 
             /* Only check the valid flag and the owner if we don't have to exit the loop*/
             if ( !exit_loop && (!valid || (owner_check_out && !out_list.config.owner)) ) {
-                fprintf(stderr, "[gdma] next node bad valid=%d owner=%d next=0x%x consumed=%u\n", valid, out_list.config.owner, out_addr, consumed);
+                qemu_log_mask(LOG_GUEST_ERROR, "[gdma] next node bad valid=%d owner=%d next=0x%x consumed=%u\n", valid, out_list.config.owner, out_addr, consumed);
                 esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
                 error = true;
             }

@@ -3,9 +3,9 @@
 aka_sd.py - cree une image de carte SD (FAT32) pour l'emulateur AKA.
 
   aka_sd.py -o sd.img --size 128 --app PAKAMAN=firmware.bin [--meta PAKAMAN=meta.json]
-            [--screen PAKAMAN=screen.bpm] [--tree dossier] [--label AKA]
+            [--screen PAKAMAN=screen.bmp] [--tree dossier] [--label AKA]
 
-Une application = un dossier a la racine avec firmware.bin (+ meta.json, screen.bpm).
+Une application = un dossier a la racine avec firmware.bin (+ meta.json, screen.bmp).
 --tree copie en plus le contenu d'un dossier tel quel a la racine (ex. AKA/lang).
 La taille doit etre une puissance de 2 en Mo (exigence de l'emulation SD de QEMU).
 """
@@ -28,7 +28,7 @@ def main():
     ap.add_argument("--label", default="AKA")
     ap.add_argument("--app", action="append", help="DOSSIER=firmware.bin")
     ap.add_argument("--meta", action="append", help="DOSSIER=meta.json")
-    ap.add_argument("--screen", action="append", help="DOSSIER=screen.bpm")
+    ap.add_argument("--screen", action="append", help="DOSSIER=screen.bmp")
     ap.add_argument("--tree", action="append", help="dossier copie a la racine")
     a = ap.parse_args()
     if a.size & (a.size - 1):
@@ -48,7 +48,7 @@ def main():
             shutil.copy(p, os.path.join(stage, folder, "meta.json"))
         for folder, p in kv(a.screen).items():
             os.makedirs(os.path.join(stage, folder), exist_ok=True)
-            shutil.copy(p, os.path.join(stage, folder, "screen.bpm"))
+            shutil.copy(p, os.path.join(stage, folder, "screen.bmp"))
         for t in a.tree or []:
             shutil.copytree(t, stage, dirs_exist_ok=True)
         entries = [os.path.join(stage, e) for e in os.listdir(stage)]
